@@ -174,3 +174,23 @@ mod tests {
         assert!(ok.ends_with("index.mu"));
     }
 }
+
+#[cfg(test)]
+mod interop_tests {
+    use super::*;
+
+    /// Golden path hashes must match LinkClient::query / Python NomadNet truncated SHA-256.
+    #[test]
+    fn interop_path_hashes_match_wire_contract() {
+        assert_eq!(
+            hex::encode(path_hash("/page/index.mu")),
+            hex::encode(truncated_hash(b"/page/index.mu"))
+        );
+        assert_eq!(
+            hex::encode(path_hash("/file/readme.txt")),
+            hex::encode(truncated_hash(b"/file/readme.txt"))
+        );
+        // Distinct routes must not collide for typical short names.
+        assert_ne!(path_hash("/page/index.mu"), path_hash("/page/about.mu"));
+    }
+}
