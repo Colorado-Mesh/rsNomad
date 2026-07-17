@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::NomadError;
 use crate::micron::default_index_page;
 use crate::paths::{
-    resolve_under_root, strip_file_prefix, strip_page_prefix, validate_content_relative_path,
+    is_hidden_or_allowlist_name, resolve_under_root, strip_file_prefix, strip_page_prefix,
+    validate_content_relative_path,
 };
 
 /// Default max page body (matches mesh-client client limit).
@@ -240,6 +241,11 @@ fn collect_files(
             return Err(NomadError::message("content listing exceeds limit"));
         }
         let entry = entry?;
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        // NomadNet parity: never list/serve dotfiles or `*.allowed` allowlists.
+        if is_hidden_or_allowlist_name(&file_name) {
+            continue;
+        }
         let path = entry.path();
         let meta = fs::symlink_metadata(&path)?;
         if meta.file_type().is_symlink() {
@@ -257,6 +263,9 @@ fn collect_files(
             .map_err(|_| NomadError::message("path outside content root"))?
             .to_string_lossy()
             .replace('\\', "/");
+        if validate_content_relative_path(&rel).is_err() {
+            continue;
+        }
         let modified_ms = meta.modified().ok().and_then(|t| {
             t.duration_since(UNIX_EPOCH)
                 .ok()
@@ -309,5 +318,24 @@ mod tests {
         std::fs::write(dir.path().join("pages/big.mu"), vec![b'x'; 32]).unwrap();
         let err = store.read_page_rel("big.mu").unwrap_err();
         assert!(matches!(err, NomadError::TooLarge { .. }));
+    }
+
+    #[test]
+    fn list_skips_dotfiles_and_allowed_suffix() {
+        let dir = tempdir().unwrap();
+        let store = NomadContentStore::new(NomadContentRoots::under(dir.path())).unwrap();
+        store.write_page_rel("index.mu", b"> ok\n").unwrap();
+        std::fs::write(dir.path().join("pages/.hidden.mu"), b"secret").unwrap();
+        std::fs::write(dir.path().join("pages/index.mu.allowed"), b"allow").unwrap();
+        store.write_file_rel("readme.txt", b"hi").unwrap();
+        std::fs::write(dir.path().join("files/.cache"), b"x").unwrap();
+        let pages = store.list_pages().unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].path, "index.mu");
+        let files = store.list_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "readme.txt");
+        assert!(store.read_page_rel(".hidden.mu").is_err());
+        assert!(store.read_file_rel(".cache").is_err());
     }
 }

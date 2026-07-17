@@ -171,6 +171,8 @@ Paths are canonicalized under each root; `..` and absolute escapes are rejected.
 - Large responses: use normal `Reply` bytes; `LinkManager` upgrades to a response
   Resource when the packed reply exceeds the Link MDU
 - Announce app data: raw UTF-8 display name (also accepted by mesh-client discovery)
+- Hidden paths: dotfiles and `*.allowed` are not listed or served (NomadNet parity)
+- Concurrency: in-flight request budget (default 8) plus a sliding-window rate limit
 
 ## Feature Status
 
@@ -181,7 +183,8 @@ Paths are canonicalized under each root; `..` and absolute escapes are rejected.
 | Announce | Startup + periodic + transport reannounce with display name |
 | Form payload decode | MessagePack `field_*` / `var_*` maps |
 | Default index | Placeholder Micron page when `index.mu` is missing |
-| Path safety | Traversal rejection, response size limits |
+| Path safety | Traversal rejection, response size limits, skip dotfiles/`*.allowed` |
+| Request budget | Bounded in-flight handlers + per-window admit limit |
 | CGI / executable pages | **Not implemented** (explicit non-goal for v1) |
 | Markdown CMS | Application concern (e.g. mesh-client UI) — not in this crate |
 | Chat / forums | Roadmap only |

@@ -17,8 +17,8 @@ pub use error::NomadError;
 pub use micron::{default_index_page, not_found_page};
 pub use node::{NomadNode, NomadNodeConfig, NomadServeStats};
 pub use paths::{
-    NOMAD_NODE_ASPECT, normalize_file_route, normalize_page_route, path_hash, resolve_under_root,
-    strip_page_prefix, validate_content_relative_path,
+    NOMAD_NODE_ASPECT, is_hidden_or_allowlist_name, normalize_file_route, normalize_page_route,
+    path_hash, resolve_under_root, strip_page_prefix, validate_content_relative_path,
 };
 pub use request::{NomadRequestFields, decode_request_fields};
 pub use storage::{NomadContentRoots, NomadContentStore, NomadPageEntry};

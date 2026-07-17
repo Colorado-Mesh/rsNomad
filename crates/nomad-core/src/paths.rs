@@ -78,6 +78,16 @@ pub fn strip_file_prefix(route: &str) -> Result<&str, NomadError> {
     Ok(rel)
 }
 
+/// True for NomadNet-style hidden / allowlist artifacts (dotfiles, `*.allowed`).
+/// These must not be listed or served as content.
+pub fn is_hidden_or_allowlist_name(name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    name.starts_with('.') || name.ends_with(".allowed")
+}
+
 /// Validate a content-relative path (no leading slash, no `..`, no control chars).
 pub fn validate_content_relative_path(rel: &str) -> Result<(), NomadError> {
     let rel = rel.trim().trim_start_matches('/');
@@ -102,6 +112,11 @@ pub fn validate_content_relative_path(rel: &str) -> Result<(), NomadError> {
                 let name = name.to_string_lossy();
                 if name.chars().any(|c| c.is_control()) {
                     return Err(NomadError::InvalidPath("control characters in path".into()));
+                }
+                if is_hidden_or_allowlist_name(&name) {
+                    return Err(NomadError::InvalidPath(
+                        "hidden or allowlist paths are not served".into(),
+                    ));
                 }
             }
             Component::CurDir => {}
@@ -240,6 +255,18 @@ mod tests {
                 Err(NomadError::PathTraversal)
             ));
         }
+    }
+
+    #[test]
+    fn rejects_dotfiles_and_allowed_suffix() {
+        assert!(is_hidden_or_allowlist_name(".secret"));
+        assert!(is_hidden_or_allowlist_name("index.mu.allowed"));
+        assert!(!is_hidden_or_allowlist_name("index.mu"));
+        assert!(validate_content_relative_path(".hidden.mu").is_err());
+        assert!(validate_content_relative_path("docs/.keep").is_err());
+        assert!(validate_content_relative_path("page.mu.allowed").is_err());
+        assert!(normalize_page_route("/page/.hidden.mu").is_err());
+        assert!(normalize_file_route("/file/notes.allowed").is_err());
     }
 }
 

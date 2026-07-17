@@ -449,3 +449,113 @@ fn handle_request(shared: &SharedState, path_hash_bytes: [u8; 16]) -> RequestOut
         RequestOutcome::Drop
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::NomadContentRoots;
+    use rns_runtime::link_manager::RequestOutcome;
+    use tempfile::TempDir;
+
+    fn shared_with_content(
+        dir: &TempDir,
+        pages: &[(&str, &[u8])],
+        files: &[(&str, &[u8])],
+    ) -> Arc<SharedState> {
+        let store = NomadContentStore::new(NomadContentRoots::under(dir.path())).unwrap();
+        for (path, body) in pages {
+            store.write_page_rel(path, body).unwrap();
+        }
+        for (path, body) in files {
+            store.write_file_rel(path, body).unwrap();
+        }
+        let shared = Arc::new(SharedState {
+            display_name: Mutex::new("Test".into()),
+            store,
+            routes: RwLock::new(RouteTable::new()),
+            stats: NomadServeStatsInner::new(),
+            budget: RequestBudget::new(),
+        });
+        {
+            let mut routes = shared.routes.write().unwrap();
+            for (path, _) in pages {
+                routes
+                    .register(normalize_page_route(path).unwrap())
+                    .unwrap();
+            }
+            for (path, _) in files {
+                routes
+                    .register(normalize_file_route(path).unwrap())
+                    .unwrap();
+            }
+        }
+        shared
+    }
+
+    #[test]
+    fn link_request_handler_serves_page_and_file() {
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content(
+            &dir,
+            &[("index.mu", b"> Hello from host\n")],
+            &[("readme.txt", b"file-bytes")],
+        );
+
+        let page_hash = path_hash("/page/index.mu");
+        match handle_request(&shared, page_hash) {
+            RequestOutcome::Reply(bytes) => {
+                assert_eq!(bytes, b"> Hello from host\n");
+            }
+            _ => panic!("expected page reply from link request handler"),
+        }
+
+        let file_hash = path_hash("/file/readme.txt");
+        match handle_request(&shared, file_hash) {
+            RequestOutcome::Reply(bytes) => {
+                assert_eq!(bytes, b"file-bytes");
+            }
+            _ => panic!("expected file reply from link request handler"),
+        }
+
+        let stats = shared.stats.snapshot();
+        assert_eq!(stats.page_hits, 1);
+        assert_eq!(stats.file_hits, 1);
+        assert_eq!(stats.request_count, 2);
+    }
+
+    #[test]
+    fn request_budget_bounds_in_flight_concurrency() {
+        let budget = RequestBudget::new();
+        let now = 1_000u64;
+        let mut guards = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_REQUESTS {
+            guards.push(budget.try_acquire(now).expect("admit under cap"));
+        }
+        assert!(
+            budget.try_acquire(now).is_none(),
+            "must reject over concurrency"
+        );
+        drop(guards);
+        assert!(
+            budget.try_acquire(now).is_some(),
+            "must admit again after in-flight drain"
+        );
+    }
+
+    #[test]
+    fn link_request_handler_skips_unregistered_dotfile_routes() {
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n")], &[]);
+        // Forbidden routes are not registered; handler returns the not-found Micron page.
+        let forbidden = path_hash("/page/.secret.mu");
+        match handle_request(&shared, forbidden) {
+            RequestOutcome::Reply(bytes) => {
+                let body = String::from_utf8_lossy(&bytes);
+                assert!(body.contains("Not found"));
+            }
+            RequestOutcome::Drop => panic!("expected not-found reply"),
+            _ => panic!("unexpected request outcome"),
+        }
+        assert_eq!(shared.stats.page_hits.load(Ordering::Relaxed), 0);
+    }
+}
