@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to create or update"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
+  PACKAGE_ROOT: rsNomad
+  RSNOMAD_RSRETICULUM_REF: main
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact_suffix }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_suffix: linux-x86_64
+            archive: tar.gz
+          - os: macos-latest
+            artifact_suffix: macos
+            archive: tar.gz
+          - os: windows-latest
+            artifact_suffix: windows-x86_64
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    env:
+      ARCHIVE_NAME: rsNomad-${{ github.event.inputs.tag_name || github.ref_name }}-${{ matrix.artifact_suffix }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          path: rsNomad
+      - uses: actions/checkout@v5
+        with:
+          repository: ratspeak/rsReticulum
+          ref: ${{ env.RSNOMAD_RSRETICULUM_REF }}
+          path: rsReticulum
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rsNomad -> target
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config
+      - name: Build release library
+        working-directory: rsNomad
+        run: cargo build --workspace --release
+      - name: Stage archive contents
+        shell: bash
+        working-directory: rsNomad
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${PACKAGE_ROOT}"
+          cp README.md LICENSE "dist/${PACKAGE_ROOT}/"
+          cp -R crates "dist/${PACKAGE_ROOT}/"
+          cp Cargo.toml Cargo.lock "dist/${PACKAGE_ROOT}/" 2>/dev/null || cp Cargo.toml "dist/${PACKAGE_ROOT}/"
+      - name: Create tar archive
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: rsNomad
+        run: tar -czf "${ARCHIVE_NAME}.tar.gz" -C dist "${PACKAGE_ROOT}"
+      - name: Create zip archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: rsNomad
+        run: Compress-Archive -Path "dist/${env:PACKAGE_ROOT}" -DestinationPath "${env:ARCHIVE_NAME}.zip" -Force
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            rsNomad/*.tar.gz
+            rsNomad/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: artifacts/**/*
+          generate_release_notes: true

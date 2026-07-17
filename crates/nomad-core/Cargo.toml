@@ -1,0 +1,25 @@
+[package]
+name = "nomad-core"
+description = "Nomad Network page/file hosting for Reticulum (rsReticulum)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+hex = { workspace = true }
+rmpv = { workspace = true }
+rns-crypto = { workspace = true }
+rns-identity = { workspace = true }
+rns-runtime = { workspace = true }
+rns-transport = { workspace = true }
+rns-wire = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

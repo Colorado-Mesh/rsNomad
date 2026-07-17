@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nomad-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Reticulum crates from a sibling rsReticulum checkout during development.
+rns-crypto = { path = "../rsReticulum/crates/rns-crypto", version = "1.0.1" }
+rns-wire = { path = "../rsReticulum/crates/rns-wire", version = "1.0.1" }
+rns-identity = { path = "../rsReticulum/crates/rns-identity", version = "1.0.1" }
+rns-link = { path = "../rsReticulum/crates/rns-link", version = "1.0.1" }
+rns-protocol = { path = "../rsReticulum/crates/rns-protocol", version = "1.0.1" }
+rns-transport = { path = "../rsReticulum/crates/rns-transport", version = "1.0.1" }
+rns-runtime = { path = "../rsReticulum/crates/rns-runtime", version = "1.0.1" }
+
+# Workspace crates
+nomad-core = { path = "crates/nomad-core", version = "0.1.0" }
+
+# Encoding / serialization
+base64 = "0.22"
+rmpv = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+
+# Logging / errors
+tracing = "0.1"
+thiserror = "2"
+hex = "0.4"
+tempfile = "3"
