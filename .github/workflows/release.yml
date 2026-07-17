@@ -1,6 +1,8 @@
+---
+# yamllint disable rule:line-length
 name: Release
 
-on:
+"on":
   push:
     tags:
       - "v*"
@@ -48,8 +50,10 @@ jobs:
           repository: ratspeak/rsReticulum
           ref: ${{ env.RSNOMAD_RSRETICULUM_REF }}
           path: rsReticulum
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+      # v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           workspaces: rsNomad -> target
       - name: Install system deps (Linux)
@@ -95,7 +99,8 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           path: artifacts
-      - uses: softprops/action-gh-release@v2
+      # v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           files: artifacts/**/*
