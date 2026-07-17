@@ -18,6 +18,12 @@ use crate::micron::not_found_page;
 use crate::paths::{NOMAD_NODE_ASPECT, normalize_file_route, normalize_page_route, path_hash};
 use crate::storage::NomadContentStore;
 
+/// Max concurrent request handlers (disk/network budget).
+const MAX_IN_FLIGHT_REQUESTS: u64 = 8;
+/// Max requests accepted per sliding window.
+const MAX_REQUESTS_PER_WINDOW: u64 = 60;
+const REQUEST_WINDOW_MS: u64 = 10_000;
+
 #[derive(Debug, Clone)]
 pub struct NomadNodeConfig {
     pub display_name: String,
@@ -79,6 +85,54 @@ struct SharedState {
     store: NomadContentStore,
     routes: RwLock<RouteTable>,
     stats: NomadServeStatsInner,
+    budget: RequestBudget,
+}
+
+struct RequestBudget {
+    in_flight: AtomicU64,
+    window_start_ms: AtomicU64,
+    window_count: AtomicU64,
+}
+
+impl RequestBudget {
+    fn new() -> Self {
+        Self {
+            in_flight: AtomicU64::new(0),
+            window_start_ms: AtomicU64::new(0),
+            window_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Try to admit one request. Returns a guard that decrements in-flight on drop.
+    fn try_acquire(&self, now_ms: u64) -> Option<RequestBudgetGuard<'_>> {
+        let start = self.window_start_ms.load(Ordering::Relaxed);
+        if start == 0 || now_ms.saturating_sub(start) >= REQUEST_WINDOW_MS {
+            self.window_start_ms.store(now_ms, Ordering::Relaxed);
+            self.window_count.store(0, Ordering::Relaxed);
+        }
+        let count = self.window_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count > MAX_REQUESTS_PER_WINDOW {
+            self.window_count.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        let in_flight = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        if in_flight > MAX_IN_FLIGHT_REQUESTS {
+            self.in_flight.fetch_sub(1, Ordering::Relaxed);
+            self.window_count.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(RequestBudgetGuard { budget: self })
+    }
+}
+
+struct RequestBudgetGuard<'a> {
+    budget: &'a RequestBudget,
+}
+
+impl Drop for RequestBudgetGuard<'_> {
+    fn drop(&mut self) {
+        self.budget.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 struct NomadServeStatsInner {
@@ -141,6 +195,7 @@ impl NomadNode {
             store,
             routes: RwLock::new(RouteTable::new()),
             stats: NomadServeStatsInner::new(),
+            budget: RequestBudget::new(),
         });
 
         // Pre-register known filesystem pages/files for path-hash lookup.
@@ -195,12 +250,6 @@ impl NomadNode {
             link_mgr.run().await;
         });
 
-        if config.announce_at_start {
-            let _ =
-                send_nomad_announce(&transport_tx, &identity, Some(config.display_name.as_str()))
-                    .await;
-        }
-
         let announce_task = config.announce_interval.map(|interval| {
             let tx = transport_tx.clone();
             let id = identity.clone();
@@ -221,7 +270,9 @@ impl NomadNode {
             })
         });
 
-        Ok(Self {
+        // Construct Self before the optional startup announce so cancellation/Drop
+        // can abort the link task (no untracked zombie destination).
+        let node = Self {
             destination_hash,
             identity_hash: identity.hash,
             shared,
@@ -229,7 +280,11 @@ impl NomadNode {
             identity,
             _link_task: link_task,
             _announce_task: announce_task,
-        })
+        };
+        if config.announce_at_start {
+            let _ = node.announce_now().await;
+        }
+        Ok(node)
     }
 
     pub fn destination_hash(&self) -> [u8; 16] {
@@ -294,8 +349,15 @@ impl NomadNode {
     }
 
     pub fn shutdown(self) {
+        // Drop impl aborts background tasks.
+        drop(self);
+    }
+}
+
+impl Drop for NomadNode {
+    fn drop(&mut self) {
         self._link_task.abort();
-        if let Some(task) = self._announce_task {
+        if let Some(task) = self._announce_task.take() {
             task.abort();
         }
     }
@@ -331,11 +393,16 @@ fn lookup_route(shared: &SharedState, path_hash_bytes: [u8; 16]) -> Option<Strin
 }
 
 fn handle_request(shared: &SharedState, path_hash_bytes: [u8; 16]) -> RequestOutcome {
-    shared.stats.request_count.fetch_add(1, Ordering::Relaxed);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    let Some(_budget) = shared.budget.try_acquire(now_ms) else {
+        tracing::warn!("nomad request budget exceeded; dropping request");
+        return RequestOutcome::Drop;
+    };
+
+    shared.stats.request_count.fetch_add(1, Ordering::Relaxed);
     shared
         .stats
         .last_request_ms

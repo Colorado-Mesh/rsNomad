@@ -1,10 +1,14 @@
 //! Path normalization and safe resolution for Nomad `/page/` and `/file/` routes.
 
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use rns_crypto::sha::truncated_hash;
 
 use crate::error::NomadError;
+
+/// Max path components under a content root (DoS / deep-nesting guard).
+pub const MAX_PATH_COMPONENTS: usize = 32;
 
 /// Aspect Nomad Network nodes announce and serve under.
 pub const NOMAD_NODE_ASPECT: &str = "nomadnetwork.node";
@@ -74,7 +78,7 @@ pub fn strip_file_prefix(route: &str) -> Result<&str, NomadError> {
     Ok(rel)
 }
 
-/// Validate a content-relative path (no leading slash, no `..`).
+/// Validate a content-relative path (no leading slash, no `..`, no control chars).
 pub fn validate_content_relative_path(rel: &str) -> Result<(), NomadError> {
     let rel = rel.trim().trim_start_matches('/');
     if rel.is_empty() {
@@ -83,10 +87,23 @@ pub fn validate_content_relative_path(rel: &str) -> Result<(), NomadError> {
     if rel.contains('\0') || rel.contains('\\') {
         return Err(NomadError::InvalidPath("invalid path characters".into()));
     }
+    if rel.chars().any(|c| c.is_control()) {
+        return Err(NomadError::InvalidPath("control characters in path".into()));
+    }
     let path = Path::new(rel);
+    let mut components = 0usize;
     for component in path.components() {
         match component {
-            Component::Normal(_) => {}
+            Component::Normal(name) => {
+                components += 1;
+                if components > MAX_PATH_COMPONENTS {
+                    return Err(NomadError::InvalidPath("path too deep".into()));
+                }
+                let name = name.to_string_lossy();
+                if name.chars().any(|c| c.is_control()) {
+                    return Err(NomadError::InvalidPath("control characters in path".into()));
+                }
+            }
             Component::CurDir => {}
             _ => return Err(NomadError::PathTraversal),
         }
@@ -94,31 +111,62 @@ pub fn validate_content_relative_path(rel: &str) -> Result<(), NomadError> {
     Ok(())
 }
 
-/// Resolve `rel` under `root`, rejecting escapes outside the root.
+/// Resolve `rel` under `root`, rejecting escapes and symlink components.
 pub fn resolve_under_root(root: &Path, rel: &str) -> Result<PathBuf, NomadError> {
     validate_content_relative_path(rel)?;
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let candidate = root.join(rel.trim_start_matches('/'));
-    if let Ok(canon) = candidate.canonicalize() {
-        if !canon.starts_with(&root) {
+    if root.exists() {
+        let root_meta = fs::symlink_metadata(root).map_err(NomadError::Io)?;
+        if root_meta.file_type().is_symlink() {
             return Err(NomadError::PathTraversal);
         }
-        return Ok(canon);
     }
-    if let Some(parent) = candidate.parent() {
-        if parent.exists() {
-            let parent_canon = parent.canonicalize().map_err(NomadError::Io)?;
-            if !parent_canon.starts_with(&root) {
+    let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    // Walk component-by-component without following symlinks.
+    let mut cur = root_canon.clone();
+    for component in Path::new(rel.trim_start_matches('/')).components() {
+        let Component::Normal(name) = component else {
+            return Err(NomadError::PathTraversal);
+        };
+        cur = cur.join(name);
+        if cur.exists() {
+            let meta = fs::symlink_metadata(&cur).map_err(NomadError::Io)?;
+            if meta.file_type().is_symlink() {
                 return Err(NomadError::PathTraversal);
             }
         }
     }
-    Ok(candidate)
+
+    if cur.exists() {
+        let canon = cur.canonicalize().map_err(NomadError::Io)?;
+        if !canon.starts_with(&root_canon) {
+            return Err(NomadError::PathTraversal);
+        }
+        return Ok(canon);
+    }
+    if let Some(parent) = cur.parent() {
+        if parent.exists() {
+            let parent_meta = fs::symlink_metadata(parent).map_err(NomadError::Io)?;
+            if parent_meta.file_type().is_symlink() {
+                return Err(NomadError::PathTraversal);
+            }
+            let parent_canon = parent.canonicalize().map_err(NomadError::Io)?;
+            if !parent_canon.starts_with(&root_canon) {
+                return Err(NomadError::PathTraversal);
+            }
+        }
+    }
+    Ok(cur)
 }
 
 fn validate_route_chars(route: &str) -> Result<(), NomadError> {
     if route.contains('\0') || route.contains('\\') {
         return Err(NomadError::InvalidPath("invalid route characters".into()));
+    }
+    if route.chars().any(|c| c.is_control()) {
+        return Err(NomadError::InvalidPath(
+            "control characters in route".into(),
+        ));
     }
     Ok(())
 }
@@ -172,6 +220,26 @@ mod tests {
         ));
         let ok = resolve_under_root(&root, "index.mu").unwrap();
         assert!(ok.ends_with("index.mu"));
+    }
+
+    #[test]
+    fn rejects_control_characters_and_symlink_components() {
+        assert!(validate_content_relative_path("evil\nname.mu").is_err());
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("pages");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = root.join("link.mu");
+            symlink(&outside, &link).unwrap();
+            assert!(matches!(
+                resolve_under_root(&root, "link.mu"),
+                Err(NomadError::PathTraversal)
+            ));
+        }
     }
 }
 
