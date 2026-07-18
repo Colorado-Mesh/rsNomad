@@ -1,9 +1,14 @@
 //! Live Nomad node: register destination, serve pages/files, announce.
+//!
+//! The LinkManager request handler is invoked synchronously on the link event
+//! loop. Serve paths therefore perform bounded synchronous filesystem reads
+//! (with size caps). Callers that need non-blocking I/O should keep content
+//! small or host behind a process that isolates disk stalls.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rns_identity::identity::Identity;
 use rns_runtime::link_manager::{LinkManager, RequestOutcome, register_destination};
@@ -15,19 +20,30 @@ use tokio::task::JoinHandle;
 use crate::announce::{nomad_destination_hash, send_nomad_announce, send_nomad_announce_try};
 use crate::error::NomadError;
 use crate::micron::not_found_page;
-use crate::paths::{NOMAD_NODE_ASPECT, normalize_file_route, normalize_page_route, path_hash};
+use crate::paths::{
+    DEFAULT_INDEX_ROUTE, FILE_PREFIX, NOMAD_NODE_ASPECT, PAGE_PREFIX, normalize_file_route,
+    normalize_page_route, path_hash,
+};
 use crate::storage::NomadContentStore;
 
 /// Max concurrent request handlers (disk/network budget).
 const MAX_IN_FLIGHT_REQUESTS: u64 = 8;
-/// Max requests accepted per sliding window.
+/// Max requests accepted per fixed window.
 const MAX_REQUESTS_PER_WINDOW: u64 = 60;
-const REQUEST_WINDOW_MS: u64 = 10_000;
+const REQUEST_WINDOW: Duration = Duration::from_secs(10);
+/// Max UTF-8 bytes retained for announce / display name.
+const MAX_DISPLAY_NAME_BYTES: usize = 256;
+/// Timeout for awaited announce sends on the periodic ticker.
+const ANNOUNCE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Configuration for [`NomadNode::spawn`].
 #[derive(Debug, Clone)]
 pub struct NomadNodeConfig {
+    /// UTF-8 display name announced as app data (truncated to 256 bytes).
     pub display_name: String,
+    /// Periodic announce interval; `None` disables the ticker.
     pub announce_interval: Option<Duration>,
+    /// Send an announce immediately after spawn.
     pub announce_at_start: bool,
 }
 
@@ -41,12 +57,18 @@ impl Default for NomadNodeConfig {
     }
 }
 
+/// Snapshot of serve counters.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NomadServeStats {
+    /// Total requests admitted (including not-found).
     pub request_count: u64,
+    /// Successful page replies.
     pub page_hits: u64,
+    /// Successful file replies.
     pub file_hits: u64,
+    /// Missing routes / missing content.
     pub not_found_count: u64,
+    /// Wall-clock ms of the last admitted request, if any.
     pub last_request_ms: Option<u64>,
 }
 
@@ -80,6 +102,19 @@ impl RouteTable {
     }
 }
 
+fn rebuild_routes(routes: &mut RouteTable, store: &NomadContentStore) -> Result<(), NomadError> {
+    routes.clear();
+    for page in store.list_pages()? {
+        routes.register(normalize_page_route(&page.path)?)?;
+    }
+    for file in store.list_files()? {
+        routes.register(normalize_file_route(&file.path)?)?;
+    }
+    // Always register index even if list was empty before ensure.
+    routes.register(DEFAULT_INDEX_ROUTE.into())?;
+    Ok(())
+}
+
 struct SharedState {
     display_name: Mutex<String>,
     store: NomadContentStore,
@@ -88,39 +123,43 @@ struct SharedState {
     budget: RequestBudget,
 }
 
+struct RequestBudgetState {
+    in_flight: u64,
+    window_start: Instant,
+    window_count: u64,
+}
+
 struct RequestBudget {
-    in_flight: AtomicU64,
-    window_start_ms: AtomicU64,
-    window_count: AtomicU64,
+    state: Mutex<RequestBudgetState>,
 }
 
 impl RequestBudget {
     fn new() -> Self {
         Self {
-            in_flight: AtomicU64::new(0),
-            window_start_ms: AtomicU64::new(0),
-            window_count: AtomicU64::new(0),
+            state: Mutex::new(RequestBudgetState {
+                in_flight: 0,
+                window_start: Instant::now(),
+                window_count: 0,
+            }),
         }
     }
 
     /// Try to admit one request. Returns a guard that decrements in-flight on drop.
-    fn try_acquire(&self, now_ms: u64) -> Option<RequestBudgetGuard<'_>> {
-        let start = self.window_start_ms.load(Ordering::Relaxed);
-        if start == 0 || now_ms.saturating_sub(start) >= REQUEST_WINDOW_MS {
-            self.window_start_ms.store(now_ms, Ordering::Relaxed);
-            self.window_count.store(0, Ordering::Relaxed);
+    fn try_acquire(&self) -> Option<RequestBudgetGuard<'_>> {
+        let mut state = self.state.lock().ok()?;
+        let now = Instant::now();
+        if now.duration_since(state.window_start) >= REQUEST_WINDOW {
+            state.window_start = now;
+            state.window_count = 0;
         }
-        let count = self.window_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if count > MAX_REQUESTS_PER_WINDOW {
-            self.window_count.fetch_sub(1, Ordering::Relaxed);
+        if state.window_count >= MAX_REQUESTS_PER_WINDOW {
             return None;
         }
-        let in_flight = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        if in_flight > MAX_IN_FLIGHT_REQUESTS {
-            self.in_flight.fetch_sub(1, Ordering::Relaxed);
-            self.window_count.fetch_sub(1, Ordering::Relaxed);
+        if state.in_flight >= MAX_IN_FLIGHT_REQUESTS {
             return None;
         }
+        state.window_count += 1;
+        state.in_flight += 1;
         Some(RequestBudgetGuard { budget: self })
     }
 }
@@ -131,7 +170,9 @@ struct RequestBudgetGuard<'a> {
 
 impl Drop for RequestBudgetGuard<'_> {
     fn drop(&mut self) {
-        self.budget.in_flight.fetch_sub(1, Ordering::Relaxed);
+        if let Ok(mut state) = self.budget.state.lock() {
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
     }
 }
 
@@ -166,6 +207,31 @@ impl NomadServeStatsInner {
     }
 }
 
+fn clamp_display_name(name: impl Into<String>) -> String {
+    let mut name = name.into();
+    name.retain(|c| !c.is_control());
+    if name.len() > MAX_DISPLAY_NAME_BYTES {
+        // Truncate on a UTF-8 char boundary.
+        let mut end = MAX_DISPLAY_NAME_BYTES;
+        while end > 0 && !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
+    }
+    name
+}
+
+fn shared_display_name(shared: &SharedState) -> String {
+    shared
+        .display_name
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|e| {
+            tracing::warn!("display_name lock poisoned; using empty name");
+            e.into_inner().clone()
+        })
+}
+
 /// Running Nomad Network page/file host.
 pub struct NomadNode {
     destination_hash: [u8; 16],
@@ -185,13 +251,14 @@ impl NomadNode {
         store: NomadContentStore,
         config: NomadNodeConfig,
     ) -> Result<Self, NomadError> {
-        store.ensure_default_index(&config.display_name)?;
+        let display_name = clamp_display_name(config.display_name);
+        store.ensure_default_index(&display_name)?;
 
         let destination_hash = nomad_destination_hash(&identity);
         let event_rx = register_destination(&transport_tx, destination_hash, NOMAD_NODE_ASPECT);
 
         let shared = Arc::new(SharedState {
-            display_name: Mutex::new(config.display_name.clone()),
+            display_name: Mutex::new(display_name),
             store,
             routes: RwLock::new(RouteTable::new()),
             stats: NomadServeStatsInner::new(),
@@ -204,16 +271,7 @@ impl NomadNode {
                 .routes
                 .write()
                 .map_err(|_| NomadError::message("routes lock poisoned"))?;
-            for page in shared.store.list_pages()? {
-                let route = normalize_page_route(&page.path)?;
-                routes.register(route)?;
-            }
-            for file in shared.store.list_files()? {
-                let route = normalize_file_route(&file.path)?;
-                routes.register(route)?;
-            }
-            // Always register index even if list was empty before ensure.
-            routes.register("/page/index.mu".into())?;
+            rebuild_routes(&mut routes, &shared.store)?;
         }
 
         let signing_key = identity
@@ -229,6 +287,8 @@ impl NomadNode {
         );
 
         let handler_shared = shared.clone();
+        // Request body (`_data`) is ignored: static hosting only. Callers that
+        // need form fields should decode with `decode_request_fields` themselves.
         link_mgr.set_request_handler_ex(move |_link_id, path_hash, _data| {
             handle_request(&handler_shared, path_hash)
         });
@@ -237,17 +297,13 @@ impl NomadNode {
         let announce_identity = identity.clone();
         let announce_name = shared.clone();
         link_mgr.set_announce_handler(move || {
-            let name = announce_name
-                .display_name
-                .lock()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default();
+            let name = shared_display_name(&announce_name);
             send_nomad_announce_try(&announce_tx, &announce_identity, Some(name.as_str()));
         });
 
         let link_task = tokio::spawn(async move {
             link_mgr.run().await;
+            tracing::warn!("nomad link manager task exited");
         });
 
         let announce_task = config.announce_interval.map(|interval| {
@@ -259,14 +315,27 @@ impl NomadNode {
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     ticker.tick().await;
-                    let name = state
-                        .display_name
-                        .lock()
-                        .ok()
-                        .map(|g| g.clone())
-                        .unwrap_or_default();
-                    let _ = send_nomad_announce(&tx, &id, Some(name.as_str())).await;
+                    let name = shared_display_name(&state);
+                    match tokio::time::timeout(
+                        ANNOUNCE_SEND_TIMEOUT,
+                        send_nomad_announce(&tx, &id, Some(name.as_str())),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "nomad periodic announce failed");
+                            // Permanent channel closure: stop the ticker.
+                            if e.to_string().contains("transport channel closed") {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            tracing::warn!("nomad periodic announce timed out");
+                        }
+                    }
                 }
+                tracing::warn!("nomad announce task exited");
             })
         });
 
@@ -282,45 +351,54 @@ impl NomadNode {
             _announce_task: announce_task,
         };
         if config.announce_at_start {
-            let _ = node.announce_now().await;
+            if let Err(e) = node.announce_now().await {
+                tracing::warn!(error = %e, "nomad startup announce failed");
+            }
         }
         Ok(node)
     }
 
+    /// Destination hash for `nomadnetwork.node`.
     pub fn destination_hash(&self) -> [u8; 16] {
         self.destination_hash
     }
 
+    /// Identity hash of the hosting identity.
     pub fn identity_hash(&self) -> [u8; 16] {
         self.identity_hash
     }
 
+    /// Hex-encoded destination hash.
     pub fn destination_hash_hex(&self) -> String {
         hex::encode(self.destination_hash)
     }
 
+    /// Hex-encoded identity hash.
     pub fn identity_hash_hex(&self) -> String {
         hex::encode(self.identity_hash)
     }
 
+    /// Current display name used in announces.
     pub fn display_name(&self) -> String {
-        self.shared
-            .display_name
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        shared_display_name(&self.shared)
     }
 
+    /// Update the display name (clamped / control-stripped). Call `announce_now`
+    /// to publish the change immediately.
     pub fn set_display_name(&self, name: impl Into<String>) {
         if let Ok(mut guard) = self.shared.display_name.lock() {
-            *guard = name.into();
+            *guard = clamp_display_name(name);
+        } else {
+            tracing::warn!("display_name lock poisoned; set_display_name ignored");
         }
     }
 
+    /// Snapshot of serve counters.
     pub fn stats(&self) -> NomadServeStats {
         self.shared.stats.snapshot()
     }
 
+    /// Borrow the content store (write pages/files, then [`Self::reload_routes`]).
     pub fn store(&self) -> &NomadContentStore {
         &self.shared.store
     }
@@ -332,24 +410,22 @@ impl NomadNode {
             .routes
             .write()
             .map_err(|_| NomadError::message("routes lock poisoned"))?;
-        routes.clear();
-        for page in self.shared.store.list_pages()? {
-            routes.register(normalize_page_route(&page.path)?)?;
-        }
-        for file in self.shared.store.list_files()? {
-            routes.register(normalize_file_route(&file.path)?)?;
-        }
-        routes.register("/page/index.mu".into())?;
-        Ok(())
+        rebuild_routes(&mut routes, &self.shared.store)
     }
 
+    /// Send one announce with the current display name.
     pub async fn announce_now(&self) -> Result<(), NomadError> {
         let name = self.display_name();
-        send_nomad_announce(&self.transport_tx, &self.identity, Some(name.as_str())).await
+        tokio::time::timeout(
+            ANNOUNCE_SEND_TIMEOUT,
+            send_nomad_announce(&self.transport_tx, &self.identity, Some(name.as_str())),
+        )
+        .await
+        .map_err(|_| NomadError::message("announce send timed out"))?
     }
 
+    /// Abort background tasks and drop the node.
     pub fn shutdown(self) {
-        // Drop impl aborts background tasks.
         drop(self);
     }
 }
@@ -363,44 +439,31 @@ impl Drop for NomadNode {
     }
 }
 
+/// Look up a registered route by wire path hash.
+///
+/// Misses are definitive 404s — callers must use [`NomadNode::reload_routes`]
+/// after content CRUD. Unknown hashes must not trigger filesystem walks
+/// (remote DoS amplification).
 fn lookup_route(shared: &SharedState, path_hash_bytes: [u8; 16]) -> Option<String> {
-    if let Ok(routes) = shared.routes.read() {
-        if let Some(route) = routes.by_hash.get(&path_hash_bytes).cloned() {
-            return Some(route);
-        }
-    }
-    // Soft miss: rescan filesystem (covers CRUD that forgot reload_routes).
-    if let Ok(mut routes) = shared.routes.write() {
-        routes.clear();
-        if let Ok(pages) = shared.store.list_pages() {
-            for page in pages {
-                if let Ok(route) = normalize_page_route(&page.path) {
-                    let _ = routes.register(route);
-                }
-            }
-        }
-        if let Ok(files) = shared.store.list_files() {
-            for file in files {
-                if let Ok(route) = normalize_file_route(&file.path) {
-                    let _ = routes.register(route);
-                }
-            }
-        }
-        let _ = routes.register("/page/index.mu".into());
-        return routes.by_hash.get(&path_hash_bytes).cloned();
-    }
-    None
+    shared
+        .routes
+        .read()
+        .ok()?
+        .by_hash
+        .get(&path_hash_bytes)
+        .cloned()
 }
 
 fn handle_request(shared: &SharedState, path_hash_bytes: [u8; 16]) -> RequestOutcome {
+    let Some(_budget) = shared.budget.try_acquire() else {
+        tracing::warn!("nomad request budget exceeded; dropping request");
+        return RequestOutcome::Drop;
+    };
+
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let Some(_budget) = shared.budget.try_acquire(now_ms) else {
-        tracing::warn!("nomad request budget exceeded; dropping request");
-        return RequestOutcome::Drop;
-    };
 
     shared.stats.request_count.fetch_add(1, Ordering::Relaxed);
     shared
@@ -415,7 +478,7 @@ fn handle_request(shared: &SharedState, path_hash_bytes: [u8; 16]) -> RequestOut
         return RequestOutcome::Reply(not_found_page("/page/unknown").into_bytes());
     };
 
-    if route.starts_with("/page/") {
+    if route.starts_with(PAGE_PREFIX) {
         match shared.store.read_page_route(&route) {
             Ok(bytes) => {
                 shared.stats.page_hits.fetch_add(1, Ordering::Relaxed);
@@ -430,13 +493,14 @@ fn handle_request(shared: &SharedState, path_hash_bytes: [u8; 16]) -> RequestOut
                 RequestOutcome::Drop
             }
         }
-    } else if route.starts_with("/file/") {
+    } else if route.starts_with(FILE_PREFIX) {
         match shared.store.read_file_route(&route) {
             Ok(bytes) => {
                 shared.stats.file_hits.fetch_add(1, Ordering::Relaxed);
                 RequestOutcome::Reply(bytes)
             }
             Err(NomadError::NotFound(_)) => {
+                // Files have no Micron 404 body — drop silently (NomadNet parity).
                 shared.stats.not_found_count.fetch_add(1, Ordering::Relaxed);
                 RequestOutcome::Drop
             }
@@ -478,16 +542,7 @@ mod tests {
         });
         {
             let mut routes = shared.routes.write().unwrap();
-            for (path, _) in pages {
-                routes
-                    .register(normalize_page_route(path).unwrap())
-                    .unwrap();
-            }
-            for (path, _) in files {
-                routes
-                    .register(normalize_file_route(path).unwrap())
-                    .unwrap();
-            }
+            rebuild_routes(&mut routes, &shared.store).unwrap();
         }
         shared
     }
@@ -524,22 +579,72 @@ mod tests {
     }
 
     #[test]
+    fn unknown_path_hash_does_not_clear_or_rescan_routes() {
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n")], &[]);
+        let before = shared.routes.read().unwrap().by_hash.len();
+        assert!(before >= 1);
+
+        match handle_request(&shared, [0u8; 16]) {
+            RequestOutcome::Reply(bytes) => {
+                let body = String::from_utf8_lossy(&bytes);
+                assert!(body.contains("Not found"));
+            }
+            _ => panic!("expected not-found Micron reply"),
+        }
+
+        let after = shared.routes.read().unwrap().by_hash.len();
+        assert_eq!(before, after, "soft-miss must not wipe the route table");
+
+        // Registered page still serves without requiring a rebuild.
+        match handle_request(&shared, path_hash("/page/index.mu")) {
+            RequestOutcome::Reply(bytes) => assert_eq!(bytes, b"> ok\n"),
+            _ => panic!("expected page reply after unknown-hash miss"),
+        }
+    }
+
+    #[test]
+    fn missing_file_drops_without_reply() {
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n")], &[]);
+        {
+            let mut routes = shared.routes.write().unwrap();
+            routes.register("/file/gone.bin".into()).unwrap();
+        }
+        match handle_request(&shared, path_hash("/file/gone.bin")) {
+            RequestOutcome::Drop => {}
+            _ => panic!("expected Drop for missing file"),
+        }
+        assert_eq!(shared.stats.not_found_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn request_budget_bounds_in_flight_concurrency() {
         let budget = RequestBudget::new();
-        let now = 1_000u64;
         let mut guards = Vec::new();
         for _ in 0..MAX_IN_FLIGHT_REQUESTS {
-            guards.push(budget.try_acquire(now).expect("admit under cap"));
+            guards.push(budget.try_acquire().expect("admit under cap"));
         }
         assert!(
-            budget.try_acquire(now).is_none(),
+            budget.try_acquire().is_none(),
             "must reject over concurrency"
         );
         drop(guards);
         assert!(
-            budget.try_acquire(now).is_some(),
+            budget.try_acquire().is_some(),
             "must admit again after in-flight drain"
         );
+    }
+
+    #[test]
+    fn request_budget_bounds_window_count() {
+        let budget = RequestBudget::new();
+        for _ in 0..MAX_REQUESTS_PER_WINDOW {
+            // Drop immediately so in-flight stays under the concurrency cap;
+            // window_count still accumulates for the fixed window.
+            assert!(budget.try_acquire().is_some());
+        }
+        assert!(budget.try_acquire().is_none(), "must reject over window");
     }
 
     #[test]
@@ -557,5 +662,30 @@ mod tests {
             _ => panic!("unexpected request outcome"),
         }
         assert_eq!(shared.stats.page_hits.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn reload_routes_picks_up_new_page() {
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n")], &[]);
+        shared
+            .store
+            .write_page_rel("extra.mu", b"> extra\n")
+            .unwrap();
+        // Not registered yet.
+        match handle_request(&shared, path_hash("/page/extra.mu")) {
+            RequestOutcome::Reply(bytes) => {
+                assert!(String::from_utf8_lossy(&bytes).contains("Not found"));
+            }
+            _ => panic!("expected not-found before reload"),
+        }
+        {
+            let mut routes = shared.routes.write().unwrap();
+            rebuild_routes(&mut routes, &shared.store).unwrap();
+        }
+        match handle_request(&shared, path_hash("/page/extra.mu")) {
+            RequestOutcome::Reply(bytes) => assert_eq!(bytes, b"> extra\n"),
+            _ => panic!("expected reply after reload"),
+        }
     }
 }

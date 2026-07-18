@@ -119,7 +119,8 @@ use std::time::Duration;
 
 // Given a live rsReticulum transport channel + identity:
 let store = NomadContentStore::new(NomadContentRoots::under("/path/to/nomadnetwork"))?;
-store.ensure_default_index("My Node")?;
+// Optional: spawn() also ensures a default index from display_name.
+store.write_page_rel("docs/help.mu", b"> Help\n")?;
 
 let node = NomadNode::spawn(
     transport_tx,
@@ -134,12 +135,15 @@ let node = NomadNode::spawn(
 .await?;
 
 println!("serving at {}", node.destination_hash_hex());
-node.reload_routes()?; // after writing pages/files on disk
+node.store().write_page_rel("about.mu", b"> About\n")?;
+node.reload_routes()?; // required after content CRUD so new routes are served
 ```
 
 `NomadNode` registers the `nomadnetwork.node` destination, installs a Link
 request handler for `/page/...` and `/file/...`, and announces with the display
-name as raw UTF-8 app data (canonical NomadNet format).
+name as raw UTF-8 app data (canonical NomadNet format). The built-in handler
+serves static content only and ignores the request body; use
+`decode_request_fields` if your application needs MessagePack form maps.
 
 ## Storage Layout
 
@@ -160,31 +164,44 @@ Mapping:
 - `pages/docs/help.mu` → `/page/docs/help.mu`
 - `files/manual.pdf` → `/file/manual.pdf`
 
-Paths are canonicalized under each root; `..` and absolute escapes are rejected.
+Paths are resolved under each root without following symlink components; `..`,
+absolute escapes, NUL/backslash, and control characters are rejected. Default
+size caps are **512 KiB** for pages and **4 MiB** for files. Treat content
+directories as trusted local storage (not writable by untrusted local users);
+hard links under the same volume are not rejected.
+
+Missing `/page/...` routes return a Micron 404 body. Missing `/file/...` routes
+are dropped with no reply (NomadNet parity). Unknown path hashes do **not**
+rescan the filesystem — call `reload_routes()` after content CRUD.
 
 ## Protocol Notes
 
 - Aspect: `nomadnetwork.node`
 - Transport: Reticulum encrypted Link request/response (not LXMF)
 - Wire path hash: first 16 bytes of SHA-256 of the exact path string
-- Form data: MessagePack map of string keys (`field_*`, `var_*`) in the request body
+- Form data: `decode_request_fields` accepts a MessagePack map of string keys
+  (e.g. `field_*`, `var_*`) with size/depth caps; the built-in serve handler
+  currently ignores the request body (static hosting only)
 - Large responses: use normal `Reply` bytes; `LinkManager` upgrades to a response
   Resource when the packed reply exceeds the Link MDU
-- Announce app data: raw UTF-8 display name (also accepted by mesh-client discovery)
+- Announce app data: raw UTF-8 display name, capped at 256 bytes (also accepted
+  by mesh-client discovery)
 - Hidden paths: dotfiles and `*.allowed` are not listed or served (NomadNet parity)
-- Concurrency: in-flight request budget (default 8) plus a sliding-window rate limit
+- Concurrency: in-flight request budget (default 8) plus a fixed-window rate
+  limit (default 60 requests / 10 s). The Link request handler runs
+  synchronously on the link event loop with bounded disk reads.
 
 ## Feature Status
 
 | Area | Current behavior |
 | --- | --- |
-| Static pages | Serve `.mu` (and other text) from `pages/` with size caps |
-| Static files | Serve binaries from `files/` with size caps |
+| Static pages | Serve `.mu` (and other text) from `pages/` with 512 KiB default cap |
+| Static files | Serve binaries from `files/` with 4 MiB default cap |
 | Announce | Startup + periodic + transport reannounce with display name |
-| Form payload decode | MessagePack `field_*` / `var_*` maps |
+| Form payload decode | Helper only (`decode_request_fields`); not wired into serving |
 | Default index | Placeholder Micron page when `index.mu` is missing |
-| Path safety | Traversal rejection, response size limits, skip dotfiles/`*.allowed` |
-| Request budget | Bounded in-flight handlers + per-window admit limit |
+| Path safety | Traversal/symlink rejection, size limits, skip dotfiles/`*.allowed` |
+| Request budget | Bounded in-flight handlers + fixed-window admit limit |
 | CGI / executable pages | **Not implemented** (explicit non-goal for v1) |
 | Markdown CMS | Application concern (e.g. mesh-client UI) — not in this crate |
 | Chat / forums | Roadmap only |
