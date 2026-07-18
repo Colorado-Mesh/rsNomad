@@ -8,14 +8,17 @@ static hosting release used by mesh-client (#613).
 - Static `/page/...` and `/file/...` hosting over Reticulum Links
 - `nomadnetwork.node` announce with UTF-8 display name
 - Safe filesystem roots, size caps, Micron 404 / default index
-- MessagePack `field_*` / `var_*` request decode
+- MessagePack form decode helper (`decode_request_fields`) with size caps
+  (not yet wired into the built-in serve handler)
 - AGPL-3.0-or-later, Ratspeak-shaped README / CI
 
 ## Near-term
 
 - Optional `nomad-tools` crate with `nomad-serve-rs` headless binary
+- Wire form/`field_*` bodies into serving when dynamic pages are designed
 - Stronger interop fixtures against Python NomadNet page fetches
 - Resource response filename metadata parity (may require rsReticulum upstream)
+- Async / `spawn_blocking` serve path if LinkManager gains an async handler API
 
 ## Later (application / mesh-client)
 

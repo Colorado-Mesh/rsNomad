@@ -9,9 +9,24 @@ use tokio::sync::mpsc;
 use crate::error::NomadError;
 use crate::paths::NOMAD_NODE_ASPECT;
 
+/// Max UTF-8 bytes included as announce app data (display name).
+pub const MAX_ANNOUNCE_NAME_BYTES: usize = 256;
+
 /// Destination hash for `nomadnetwork.node` under `identity`.
 pub fn nomad_destination_hash(identity: &Identity) -> [u8; 16] {
     Destination::hash_from_name_and_identity(NOMAD_NODE_ASPECT, Some(&identity.hash))
+}
+
+fn clamp_announce_name(name: &str) -> &str {
+    let name = name.trim();
+    if name.len() <= MAX_ANNOUNCE_NAME_BYTES {
+        return name;
+    }
+    let mut end = MAX_ANNOUNCE_NAME_BYTES;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
 }
 
 /// Build a raw announce packet with optional UTF-8 display name as app data.
@@ -20,7 +35,7 @@ pub fn build_nomad_announce_packet(
     display_name: Option<&str>,
 ) -> Result<Vec<u8>, NomadError> {
     let app_data = display_name
-        .map(str::trim)
+        .map(clamp_announce_name)
         .filter(|s| !s.is_empty())
         .map(|s| s.as_bytes());
     let announce =
@@ -105,5 +120,16 @@ mod tests {
         let identity = Identity::new();
         let raw = build_nomad_announce_packet(&identity, Some("Demo Node")).unwrap();
         assert!(raw.len() > 64);
+    }
+
+    #[test]
+    fn announce_name_is_length_capped() {
+        let identity = Identity::new();
+        let huge = "n".repeat(MAX_ANNOUNCE_NAME_BYTES + 100);
+        let raw = build_nomad_announce_packet(&identity, Some(&huge)).unwrap();
+        let short =
+            build_nomad_announce_packet(&identity, Some(&"n".repeat(MAX_ANNOUNCE_NAME_BYTES)))
+                .unwrap();
+        assert_eq!(raw.len(), short.len());
     }
 }
