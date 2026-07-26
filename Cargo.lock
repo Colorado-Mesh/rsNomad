@@ -685,8 +685,10 @@ dependencies = [
  "rns-crypto",
  "rns-wire",
  "serde",
+ "serde_bytes",
  "thiserror 2.0.19",
  "tracing",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
