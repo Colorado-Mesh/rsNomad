@@ -23,12 +23,9 @@ pub enum NomadError {
     /// Page or file body exceeds the configured size cap.
     #[error("response too large ({size} > {max})")]
     TooLarge { size: usize, max: usize },
-    /// Reserved for a future start/stop lifecycle API (unused in v0.1).
-    #[error("serving is not running")]
-    NotRunning,
-    /// Reserved for a future start/stop lifecycle API (unused in v0.1).
-    #[error("already running")]
-    AlreadyRunning,
+    /// Transport outbound channel is closed (node/transport shutting down).
+    #[error("transport channel closed")]
+    TransportClosed,
 }
 
 impl NomadError {

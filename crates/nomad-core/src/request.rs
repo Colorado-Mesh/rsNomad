@@ -182,4 +182,68 @@ mod tests {
         let parsed = decode_request_fields(&buf).unwrap();
         assert_eq!(parsed.fields.len(), MAX_REQUEST_FIELDS);
     }
+
+    #[test]
+    fn coerces_binary_and_f64_values() {
+        let map = vec![
+            (
+                rmpv::Value::String("field_bin".into()),
+                rmpv::Value::Binary(b"utf8-ok".to_vec()),
+            ),
+            (rmpv::Value::String("field_f".into()), rmpv::Value::F64(1.5)),
+            (
+                rmpv::Value::String("field_bad_bin".into()),
+                rmpv::Value::Binary(vec![0xff, 0xfe]),
+            ),
+        ];
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(map)).unwrap();
+        let parsed = decode_request_fields(&buf).unwrap();
+        assert_eq!(
+            parsed.fields.get("field_bin").map(String::as_str),
+            Some("utf8-ok")
+        );
+        assert_eq!(
+            parsed.fields.get("field_f").map(String::as_str),
+            Some("1.5")
+        );
+        assert!(!parsed.fields.contains_key("field_bad_bin"));
+    }
+
+    #[test]
+    fn skips_oversized_key_and_value() {
+        let map = vec![
+            (
+                rmpv::Value::String("ok".into()),
+                rmpv::Value::String("v".into()),
+            ),
+            (
+                rmpv::Value::String("k".repeat(MAX_REQUEST_FIELD_KEY_BYTES + 1).into()),
+                rmpv::Value::String("v".into()),
+            ),
+            (
+                rmpv::Value::String("field_big".into()),
+                rmpv::Value::String("v".repeat(MAX_REQUEST_FIELD_VALUE_BYTES + 1).into()),
+            ),
+        ];
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(map)).unwrap();
+        let parsed = decode_request_fields(&buf).unwrap();
+        assert_eq!(parsed.fields.len(), 1);
+        assert_eq!(parsed.fields.get("ok").map(String::as_str), Some("v"));
+    }
+
+    #[test]
+    fn deeply_nested_msgpack_yields_empty_fields() {
+        // Nest maps deeper than MAX_REQUEST_MSGPACK_DEPTH so decode fails soft.
+        let mut inner = rmpv::Value::String("leaf".into());
+        for _ in 0..=MAX_REQUEST_MSGPACK_DEPTH {
+            inner = rmpv::Value::Map(vec![(rmpv::Value::String("k".into()), inner)]);
+        }
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &inner).unwrap();
+        let parsed = decode_request_fields(&buf).unwrap();
+        assert!(parsed.fields.is_empty());
+        assert_eq!(parsed.raw, buf);
+    }
 }

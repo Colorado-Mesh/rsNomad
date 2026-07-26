@@ -3,14 +3,17 @@
 This document parks follow-up work that is **out of scope** for the initial
 static hosting release used by mesh-client (#613).
 
-## Done / in progress (v0.1)
+## Done (v0.1)
 
 - Static `/page/...` and `/file/...` hosting over Reticulum Links
 - `nomadnetwork.node` announce with UTF-8 display name
 - Safe filesystem roots, size caps, Micron 404 / default index
+- AGPL-3.0-or-later, Ratspeak-shaped README / CI
+
+## In progress (v0.1)
+
 - MessagePack form decode helper (`decode_request_fields`) with size caps
   (not yet wired into the built-in serve handler)
-- AGPL-3.0-or-later, Ratspeak-shaped README / CI
 
 ## Near-term
 

@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::announce::{nomad_destination_hash, send_nomad_announce, send_nomad_announce_try};
+use crate::announce::{
+    clamp_node_name, nomad_destination_hash, send_nomad_announce, send_nomad_announce_try,
+};
 use crate::error::NomadError;
 use crate::micron::not_found_page;
 use crate::paths::{
@@ -31,8 +33,6 @@ const MAX_IN_FLIGHT_REQUESTS: u64 = 8;
 /// Max requests accepted per fixed window.
 const MAX_REQUESTS_PER_WINDOW: u64 = 60;
 const REQUEST_WINDOW: Duration = Duration::from_secs(10);
-/// Max UTF-8 bytes retained for announce / display name.
-const MAX_DISPLAY_NAME_BYTES: usize = 256;
 /// Timeout for awaited announce sends on the periodic ticker.
 const ANNOUNCE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -146,7 +146,10 @@ impl RequestBudget {
 
     /// Try to admit one request. Returns a guard that decrements in-flight on drop.
     fn try_acquire(&self) -> Option<RequestBudgetGuard<'_>> {
-        let mut state = self.state.lock().ok()?;
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("request budget lock poisoned; recovering");
+            e.into_inner()
+        });
         let now = Instant::now();
         if now.duration_since(state.window_start) >= REQUEST_WINDOW {
             state.window_start = now;
@@ -170,9 +173,11 @@ struct RequestBudgetGuard<'a> {
 
 impl Drop for RequestBudgetGuard<'_> {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.budget.state.lock() {
-            state.in_flight = state.in_flight.saturating_sub(1);
-        }
+        let mut state = self.budget.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("request budget lock poisoned on drop; recovering");
+            e.into_inner()
+        });
+        state.in_flight = state.in_flight.saturating_sub(1);
     }
 }
 
@@ -207,29 +212,15 @@ impl NomadServeStatsInner {
     }
 }
 
-fn clamp_display_name(name: impl Into<String>) -> String {
-    let mut name = name.into();
-    name.retain(|c| !c.is_control());
-    if name.len() > MAX_DISPLAY_NAME_BYTES {
-        // Truncate on a UTF-8 char boundary.
-        let mut end = MAX_DISPLAY_NAME_BYTES;
-        while end > 0 && !name.is_char_boundary(end) {
-            end -= 1;
-        }
-        name.truncate(end);
-    }
-    name
-}
-
 fn shared_display_name(shared: &SharedState) -> String {
     shared
         .display_name
         .lock()
-        .map(|g| g.clone())
         .unwrap_or_else(|e| {
-            tracing::warn!("display_name lock poisoned; using empty name");
-            e.into_inner().clone()
+            tracing::warn!("display_name lock poisoned; recovering");
+            e.into_inner()
         })
+        .clone()
 }
 
 /// Running Nomad Network page/file host.
@@ -251,7 +242,7 @@ impl NomadNode {
         store: NomadContentStore,
         config: NomadNodeConfig,
     ) -> Result<Self, NomadError> {
-        let display_name = clamp_display_name(config.display_name);
+        let display_name = clamp_node_name(&config.display_name);
         store.ensure_default_index(&display_name)?;
 
         let destination_hash = nomad_destination_hash(&identity);
@@ -323,12 +314,12 @@ impl NomadNode {
                     .await
                     {
                         Ok(Ok(())) => {}
+                        Ok(Err(e)) if should_stop_announce_loop(&e) => {
+                            tracing::warn!(error = %e, "nomad periodic announce stopped: transport closed");
+                            break;
+                        }
                         Ok(Err(e)) => {
                             tracing::warn!(error = %e, "nomad periodic announce failed");
-                            // Permanent channel closure: stop the ticker.
-                            if e.to_string().contains("transport channel closed") {
-                                break;
-                            }
                         }
                         Err(_) => {
                             tracing::warn!("nomad periodic announce timed out");
@@ -386,11 +377,11 @@ impl NomadNode {
     /// Update the display name (clamped / control-stripped). Call `announce_now`
     /// to publish the change immediately.
     pub fn set_display_name(&self, name: impl Into<String>) {
-        if let Ok(mut guard) = self.shared.display_name.lock() {
-            *guard = clamp_display_name(name);
-        } else {
-            tracing::warn!("display_name lock poisoned; set_display_name ignored");
-        }
+        let mut guard = self.shared.display_name.lock().unwrap_or_else(|e| {
+            tracing::warn!("display_name lock poisoned; recovering");
+            e.into_inner()
+        });
+        *guard = clamp_node_name(&name.into());
     }
 
     /// Snapshot of serve counters.
@@ -444,14 +435,16 @@ impl Drop for NomadNode {
 /// Misses are definitive 404s — callers must use [`NomadNode::reload_routes`]
 /// after content CRUD. Unknown hashes must not trigger filesystem walks
 /// (remote DoS amplification).
+fn should_stop_announce_loop(err: &NomadError) -> bool {
+    matches!(err, NomadError::TransportClosed)
+}
+
 fn lookup_route(shared: &SharedState, path_hash_bytes: [u8; 16]) -> Option<String> {
-    shared
-        .routes
-        .read()
-        .ok()?
-        .by_hash
-        .get(&path_hash_bytes)
-        .cloned()
+    let routes = shared.routes.read().unwrap_or_else(|e| {
+        tracing::warn!("routes lock poisoned; recovering");
+        e.into_inner()
+    });
+    routes.by_hash.get(&path_hash_bytes).cloned()
 }
 
 fn handle_request(shared: &SharedState, path_hash_bytes: [u8; 16]) -> RequestOutcome {
@@ -460,10 +453,13 @@ fn handle_request(shared: &SharedState, path_hash_bytes: [u8; 16]) -> RequestOut
         return RequestOutcome::Drop;
     };
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let now_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(_) => {
+            tracing::warn!("system clock before UNIX_EPOCH; last_request_ms set to 0");
+            0
+        }
+    };
 
     shared.stats.request_count.fetch_add(1, Ordering::Relaxed);
     shared
@@ -687,5 +683,81 @@ mod tests {
             RequestOutcome::Reply(bytes) => assert_eq!(bytes, b"> extra\n"),
             _ => panic!("expected reply after reload"),
         }
+    }
+
+    #[test]
+    fn request_budget_recovers_from_poison() {
+        let budget = RequestBudget::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = budget.state.lock().unwrap();
+            panic!("poison budget");
+        }));
+        let guard = budget
+            .try_acquire()
+            .expect("must admit after poison recovery");
+        drop(guard);
+        assert!(
+            budget.try_acquire().is_some(),
+            "in_flight must decrement after poisoned drop path"
+        );
+    }
+
+    #[test]
+    fn lookup_route_recovers_from_poison() {
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n")], &[]);
+        let page_hash = path_hash("/page/index.mu");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shared.routes.write().unwrap();
+            panic!("poison routes");
+        }));
+        assert_eq!(
+            lookup_route(&shared, page_hash).as_deref(),
+            Some("/page/index.mu")
+        );
+    }
+
+    #[test]
+    fn announce_loop_stops_only_on_transport_closed() {
+        assert!(should_stop_announce_loop(&NomadError::TransportClosed));
+        assert!(!should_stop_announce_loop(&NomadError::message("other")));
+        assert!(!should_stop_announce_loop(&NomadError::NotFound(
+            "x".into()
+        )));
+    }
+
+    #[test]
+    fn route_register_detects_hash_collision() {
+        let mut table = RouteTable::new();
+        let route = "/page/a.mu".to_string();
+        let hash = path_hash(&route);
+        table
+            .by_hash
+            .insert(hash, "/page/colliding-other.mu".into());
+        let err = table.register(route).unwrap_err();
+        assert!(err.to_string().contains("collision"));
+    }
+
+    #[test]
+    fn display_name_clamp_via_shared_mutex() {
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n")], &[]);
+        {
+            let mut guard = shared.display_name.lock().unwrap();
+            *guard = clamp_node_name("  hi\nthere  ");
+        }
+        assert_eq!(shared_display_name(&shared), "hithere");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shared.display_name.lock().unwrap();
+            panic!("poison name");
+        }));
+        {
+            let mut guard = shared
+                .display_name
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = clamp_node_name("recovered");
+        }
+        assert_eq!(shared_display_name(&shared), "recovered");
     }
 }

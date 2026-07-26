@@ -145,6 +145,13 @@ name as raw UTF-8 app data (canonical NomadNet format). The built-in handler
 serves static content only and ignores the request body; use
 `decode_request_fields` if your application needs MessagePack form maps.
 
+This crate is not published to crates.io. For the full public API (CRUD helpers,
+stats, announce, error types, limits), generate local docs:
+
+```bash
+cargo doc -p nomad-core --open
+```
+
 ## Storage Layout
 
 NomadNet-compatible roots:
@@ -166,9 +173,12 @@ Mapping:
 
 Paths are resolved under each root without following symlink components; `..`,
 absolute escapes, NUL/backslash, and control characters are rejected. Default
-size caps are **512 KiB** for pages and **4 MiB** for files. Treat content
-directories as trusted local storage (not writable by untrusted local users);
-hard links under the same volume are not rejected.
+size caps are **512 KiB** for pages and **4 MiB** for files.
+
+**Trust model:** content directories are trusted local storage. Operators must
+ensure they are not writable by untrusted local users. Symlink components are
+rejected; hard links under the same volume are not rejected (a hard-linked file
+inside the root is treated as ordinary content).
 
 Missing `/page/...` routes return a Micron 404 body. Missing `/file/...` routes
 are dropped with no reply (NomadNet parity). Unknown path hashes do **not**

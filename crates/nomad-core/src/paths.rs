@@ -189,7 +189,8 @@ pub fn resolve_under_root(root: &Path, rel: &str) -> Result<PathBuf, NomadError>
     Ok(cur)
 }
 
-fn reject_if_symlink(path: &Path) -> Result<(), NomadError> {
+/// Reject `path` when it is a symlink (does not follow the link).
+pub(crate) fn reject_if_symlink(path: &Path) -> Result<(), NomadError> {
     let meta = fs::symlink_metadata(path).map_err(NomadError::Io)?;
     if meta.file_type().is_symlink() {
         return Err(NomadError::PathTraversal);
@@ -346,6 +347,45 @@ mod tests {
         assert!(validate_content_relative_path("page.mu.allowed").is_err());
         assert!(normalize_page_route("/page/.hidden.mu").is_err());
         assert!(normalize_file_route("/file/notes.allowed").is_err());
+    }
+
+    #[test]
+    fn strip_prefix_error_paths() {
+        assert!(matches!(
+            strip_page_prefix("/file/x.mu"),
+            Err(NomadError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            strip_file_prefix("/page/x.mu"),
+            Err(NomadError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            strip_page_prefix("/page/"),
+            Err(NomadError::InvalidPath(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_relative_path_and_component() {
+        let long_path = "a".repeat(MAX_REL_PATH_BYTES + 1);
+        assert!(matches!(
+            validate_content_relative_path(&long_path),
+            Err(NomadError::InvalidPath(_))
+        ));
+        let long_comp = format!("{}.mu", "c".repeat(MAX_COMPONENT_BYTES));
+        assert!(matches!(
+            validate_content_relative_path(&long_comp),
+            Err(NomadError::InvalidPath(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_under_missing_root_keeps_logical_path() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("pages-not-yet");
+        let resolved = resolve_under_root(&root, "index.mu").unwrap();
+        assert!(resolved.ends_with("index.mu"));
+        assert!(resolved.starts_with(&root));
     }
 }
 

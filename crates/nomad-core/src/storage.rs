@@ -2,10 +2,10 @@
 //!
 //! Content directories are trusted local storage: operators must ensure they are
 //! not writable by untrusted local users. Symlink components are rejected;
-//! hard links under the same volume are not rejected (document the trust model).
+//! hard links under the same volume are not rejected (see README trust model).
 
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::NomadError;
 use crate::micron::default_index_page;
 use crate::paths::{
-    is_hidden_or_allowlist_name, resolve_under_root, strip_file_prefix, strip_page_prefix,
-    validate_content_relative_path,
+    is_hidden_or_allowlist_name, reject_if_symlink, resolve_under_root, strip_file_prefix,
+    strip_page_prefix, validate_content_relative_path,
 };
 
 /// Default max page body (matches mesh-client client limit).
@@ -96,8 +96,10 @@ impl NomadContentStore {
     pub fn ensure_default_index(&self, display_name: &str) -> Result<(), NomadError> {
         let path = resolve_under_root(&self.roots.pages_dir, "index.mu")?;
         match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => return Err(NomadError::PathTraversal),
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                reject_if_symlink(&path)?;
+                return Ok(());
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(NomadError::Io(e)),
         }
@@ -209,10 +211,8 @@ fn delete_rel(root: &Path, rel: &str) -> Result<(), NomadError> {
 
 /// Read at most `max` bytes; reject without allocating the full oversize body.
 fn read_limited(path: &Path, max: usize) -> Result<Vec<u8>, NomadError> {
+    reject_if_symlink(path)?;
     let meta = fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() {
-        return Err(NomadError::PathTraversal);
-    }
     if meta.len() > max as u64 {
         return Err(NomadError::TooLarge {
             size: usize::try_from(meta.len()).unwrap_or(usize::MAX),
@@ -240,9 +240,7 @@ fn ensure_regular_file(path: &Path, rel: &str) -> Result<(), NomadError> {
         }
         Err(e) => return Err(NomadError::Io(e)),
     };
-    if meta.file_type().is_symlink() {
-        return Err(NomadError::PathTraversal);
-    }
+    reject_if_symlink(path)?;
     if !meta.is_file() {
         return Err(NomadError::NotFound(rel.to_string()));
     }
@@ -253,25 +251,35 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), NomadError> {
     let parent = path
         .parent()
         .ok_or_else(|| NomadError::message("missing parent directory"))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| NomadError::message("missing file name"))?
-        .to_string_lossy();
-    // Unique sibling temp name (not under os.tmpdir) so rename stays atomic on the same volume.
-    let tmp_name = format!(
-        ".{file_name}.{}.tmp",
-        std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let tmp_path = parent.join(tmp_name);
-    fs::write(&tmp_path, content)?;
-    fs::rename(&tmp_path, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp_path);
-        NomadError::Io(e)
-    })?;
-    Ok(())
+    // Sibling temp file so rename/persist stays atomic on the same volume.
+    // Windows can return Access Denied when concurrent writers replace the same
+    // destination; retry briefly instead of failing the whole write.
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..8 {
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        tmp.write_all(content)?;
+        tmp.flush()?;
+        match tmp.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let retryable = matches!(
+                    e.error.kind(),
+                    std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::AlreadyExists
+                        | std::io::ErrorKind::Interrupted
+                );
+                last_err = Some(e.error);
+                if retryable && attempt + 1 < 8 {
+                    std::thread::sleep(std::time::Duration::from_millis(1 << attempt.min(4)));
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    Err(NomadError::Io(last_err.unwrap_or_else(|| {
+        std::io::Error::other("atomic_write persist retries exhausted")
+    })))
 }
 
 fn collect_files(
@@ -286,9 +294,10 @@ fn collect_files(
     if depth > MAX_LIST_DEPTH {
         return Err(NomadError::InvalidPath("directory tree too deep".into()));
     }
-    let dir_meta = fs::symlink_metadata(dir).map_err(NomadError::Io)?;
-    if dir_meta.file_type().is_symlink() {
-        return Ok(());
+    match reject_if_symlink(dir) {
+        Ok(()) => {}
+        Err(NomadError::PathTraversal) => return Ok(()),
+        Err(e) => return Err(e),
     }
     for entry in fs::read_dir(dir)? {
         if out.len() >= MAX_LISTED_ENTRIES {
@@ -301,10 +310,12 @@ fn collect_files(
             continue;
         }
         let path = entry.path();
-        let meta = fs::symlink_metadata(&path)?;
-        if meta.file_type().is_symlink() {
-            continue;
+        match reject_if_symlink(&path) {
+            Ok(()) => {}
+            Err(NomadError::PathTraversal) => continue,
+            Err(e) => return Err(e),
         }
+        let meta = fs::symlink_metadata(&path)?;
         if meta.is_dir() {
             collect_files(root, &path, out, depth + 1)?;
             continue;
@@ -317,7 +328,8 @@ fn collect_files(
             .map_err(|_| NomadError::message("path outside content root"))?
             .to_string_lossy()
             .replace('\\', "/");
-        if validate_content_relative_path(&rel).is_err() {
+        if let Err(e) = validate_content_relative_path(&rel) {
+            tracing::debug!(path = %rel, error = %e, "skipping invalid content path during listing");
             continue;
         }
         let modified_ms = meta.modified().ok().and_then(|t| {
@@ -460,5 +472,53 @@ mod tests {
             Err(NomadError::PathTraversal)
         ));
         assert!(!outside.exists());
+    }
+
+    #[test]
+    fn empty_string_read_and_delete_rejected() {
+        let (_dir, store) = test_store();
+        assert!(store.read_page_rel("").is_err());
+        assert!(store.delete_page_rel("").is_err());
+        assert!(store.read_file_rel("").is_err());
+        assert!(store.delete_file_rel("").is_err());
+    }
+
+    #[test]
+    fn delete_missing_page_is_not_found() {
+        let (_dir, store) = test_store();
+        assert!(matches!(
+            store.delete_page_rel("gone.mu"),
+            Err(NomadError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_same_path() {
+        let (dir, store) = test_store();
+        let store = std::sync::Arc::new(store);
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                let body = format!("> write {i}\n");
+                // atomic_write retries Windows replace races; still allow a few
+                // outer attempts so the test stays deterministic under load.
+                let mut last = None;
+                for _ in 0..16 {
+                    match store.write_page_rel("race.mu", body.as_bytes()) {
+                        Ok(()) => return,
+                        Err(e) => last = Some(e),
+                    }
+                    std::thread::yield_now();
+                }
+                panic!("write failed after retries: {last:?}");
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let body = store.read_page_rel("race.mu").unwrap();
+        assert!(body.starts_with(b"> write "));
+        assert!(dir.path().join("pages/race.mu").is_file());
     }
 }
