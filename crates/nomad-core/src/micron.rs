@@ -7,6 +7,10 @@ pub const MAX_MICRON_TEXT_CHARS: usize = 128;
 ///
 /// Strips control characters, replaces backticks (Micron code spans), and
 /// truncates length so operator-controlled strings cannot inject directives.
+///
+/// This is **not** a full Micron-grammar sanitizer: directive forms such as
+/// `#!c=...` are not parsed or neutralized. Suitable for operator-controlled
+/// interpolation only; dynamic user content would need a stricter filter.
 pub fn sanitize_micron_text(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control())
@@ -65,5 +69,19 @@ mod tests {
     fn sanitize_strips_backticks_and_controls() {
         assert_eq!(sanitize_micron_text("a`b\nc"), "a'bc");
         assert!(sanitize_micron_text(&"x".repeat(200)).len() == MAX_MICRON_TEXT_CHARS);
+    }
+
+    #[test]
+    fn default_index_empty_name_falls_back() {
+        let page = default_index_page("   ");
+        assert!(page.contains("Nomad node"));
+    }
+
+    #[test]
+    fn sanitize_truncates_multibyte_at_char_limit() {
+        let input = "😀".repeat(MAX_MICRON_TEXT_CHARS + 10);
+        let out = sanitize_micron_text(&input);
+        assert_eq!(out.chars().count(), MAX_MICRON_TEXT_CHARS);
+        assert!(out.is_char_boundary(out.len()));
     }
 }

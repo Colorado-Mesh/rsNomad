@@ -1,4 +1,10 @@
 /target/
 *.swp
 .DS_Store
-proptest-regressions/
+.env
+*.pem
+*.key
+*.log
+pro:
+
+-regressions/

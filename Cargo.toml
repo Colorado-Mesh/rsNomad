@@ -27,7 +27,6 @@ nomad-core = { path = "crates/nomad-core", version = "0.1.0" }
 base64 = "0.22"
 rmpv = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 
 # Async
 tokio = { version = "1", features = ["full"] }
