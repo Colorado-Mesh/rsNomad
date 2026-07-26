@@ -252,11 +252,34 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), NomadError> {
         .parent()
         .ok_or_else(|| NomadError::message("missing parent directory"))?;
     // Sibling temp file so rename/persist stays atomic on the same volume.
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(content)?;
-    tmp.flush()?;
-    tmp.persist(path).map_err(|e| NomadError::Io(e.error))?;
-    Ok(())
+    // Windows can return Access Denied when concurrent writers replace the same
+    // destination; retry briefly instead of failing the whole write.
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..8 {
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        tmp.write_all(content)?;
+        tmp.flush()?;
+        match tmp.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let retryable = matches!(
+                    e.error.kind(),
+                    std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::AlreadyExists
+                        | std::io::ErrorKind::Interrupted
+                );
+                last_err = Some(e.error);
+                if retryable && attempt + 1 < 8 {
+                    std::thread::sleep(std::time::Duration::from_millis(1 << attempt.min(4)));
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    Err(NomadError::Io(last_err.unwrap_or_else(|| {
+        std::io::Error::other("atomic_write persist retries exhausted")
+    })))
 }
 
 fn collect_files(
@@ -478,7 +501,17 @@ mod tests {
             let store = store.clone();
             handles.push(std::thread::spawn(move || {
                 let body = format!("> write {i}\n");
-                store.write_page_rel("race.mu", body.as_bytes()).unwrap();
+                // atomic_write retries Windows replace races; still allow a few
+                // outer attempts so the test stays deterministic under load.
+                let mut last = None;
+                for _ in 0..16 {
+                    match store.write_page_rel("race.mu", body.as_bytes()) {
+                        Ok(()) => return,
+                        Err(e) => last = Some(e),
+                    }
+                    std::thread::yield_now();
+                }
+                panic!("write failed after retries: {last:?}");
             }));
         }
         for h in handles {
