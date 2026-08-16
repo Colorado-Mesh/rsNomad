@@ -27,6 +27,7 @@ pub use paths::{
 pub use request::{
     MAX_REQUEST_BODY_BYTES, MAX_REQUEST_FIELD_KEY_BYTES, MAX_REQUEST_FIELD_VALUE_BYTES,
     MAX_REQUEST_FIELDS, MAX_REQUEST_MSGPACK_DEPTH, NomadRequestFields, decode_request_fields,
+    encode_request_fields,
 };
 pub use storage::{
     DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_PAGE_BYTES, MAX_LISTED_ENTRIES, NomadContentRoots,

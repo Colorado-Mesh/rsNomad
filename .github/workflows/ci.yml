@@ -13,7 +13,7 @@ permissions:
 # Pin sibling path-dep so Cargo.lock --locked stays valid in CI.
 # Bump this when regenerating the lockfile against a newer rsReticulum.
 env:
-  RSRETICULUM_REF: 3f8feb169cd57ece459fce25cebdb6dac558f4f0
+  RSRETICULUM_REF: b3de88d394112a865f97a3f8c3ed6f46ffc2b6b7
 
 jobs:
   test:
