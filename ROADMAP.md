@@ -9,15 +9,14 @@ static hosting release used by mesh-client (#613).
 - `nomadnetwork.node` announce with UTF-8 display name
 - Safe filesystem roots, size caps, Micron 404 / default index
 - AGPL-3.0-or-later, Ratspeak-shaped README / CI
-- MessagePack form encode/decode helpers (`encode_request_fields` /
-  `decode_request_fields`) with shared size caps (decode not yet wired into
-  the built-in serve handler)
+
+## In progress (v0.1)
+
+- MessagePack form decode helper (`decode_request_fields`) with size caps
+  (not yet wired into the built-in serve handler)
 
 ## Near-term
 
-- Optional `nomad-client` crate for shared fetch timeouts / Link query
-  skeleton (mesh-client product policy such as `force_path_refresh` stays in
-  clients)
 - Optional `nomad-tools` crate with `nomad-serve-rs` headless binary
 - Wire form/`field_*` bodies into serving when dynamic pages are designed
 - Stronger interop fixtures against Python NomadNet page fetches

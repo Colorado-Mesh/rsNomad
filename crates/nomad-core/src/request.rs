@@ -1,8 +1,8 @@
-//! Encode and decode NomadNet link request payloads (`field_*` / `var_*` MessagePack maps).
+//! Decode NomadNet link request payloads (`field_*` / `var_*` MessagePack maps).
 //!
-//! These helpers are available for callers that want to build or interpret form
-//! bodies. The built-in [`crate::NomadNode`] request handler serves static
-//! content only and currently ignores the request body.
+//! This helper is available for callers that want to interpret form bodies.
+//! The built-in [`crate::NomadNode`] request handler serves static content only
+//! and currently ignores the request body.
 
 use std::collections::BTreeMap;
 
@@ -32,36 +32,6 @@ pub struct NomadRequestFields {
     /// Decoding accepts any string→string map entry; prefix filtering is left
     /// to the caller.
     pub fields: BTreeMap<String, String>,
-}
-
-/// Encode request fields into MessagePack map bytes for a Link REQUEST body.
-///
-/// Empty input yields an empty `Vec` (no MessagePack envelope). Entries that
-/// exceed [`MAX_REQUEST_FIELD_KEY_BYTES`] / [`MAX_REQUEST_FIELD_VALUE_BYTES`]
-/// are skipped; at most [`MAX_REQUEST_FIELDS`] entries are retained (same soft
-/// caps as [`decode_request_fields`]). Encode failures yield an empty `Vec`.
-pub fn encode_request_fields(fields: &BTreeMap<String, String>) -> Vec<u8> {
-    if fields.is_empty() {
-        return Vec::new();
-    }
-    let mut map = Vec::new();
-    for (key, value) in fields.iter().take(MAX_REQUEST_FIELDS) {
-        if key.len() > MAX_REQUEST_FIELD_KEY_BYTES || value.len() > MAX_REQUEST_FIELD_VALUE_BYTES {
-            continue;
-        }
-        map.push((
-            rmpv::Value::String(key.as_str().into()),
-            rmpv::Value::String(value.as_str().into()),
-        ));
-    }
-    if map.is_empty() {
-        return Vec::new();
-    }
-    let mut buf = Vec::new();
-    if rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(map)).is_err() {
-        return Vec::new();
-    }
-    buf
 }
 
 /// Decode request body bytes into typed fields.
@@ -120,48 +90,6 @@ fn value_as_string(value: &rmpv::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn encode_empty_map_yields_empty_bytes() {
-        assert!(encode_request_fields(&BTreeMap::new()).is_empty());
-    }
-
-    #[test]
-    fn encode_round_trips_through_decode() {
-        let mut fields = BTreeMap::new();
-        fields.insert("field_q".to_string(), "hello".to_string());
-        fields.insert("var_mode".to_string(), "search".to_string());
-        let encoded = encode_request_fields(&fields);
-        assert!(!encoded.is_empty());
-        let parsed = decode_request_fields(&encoded).unwrap();
-        assert_eq!(parsed.fields, fields);
-    }
-
-    #[test]
-    fn encode_skips_oversized_key_and_value() {
-        let mut fields = BTreeMap::new();
-        fields.insert("ok".to_string(), "v".to_string());
-        fields.insert("k".repeat(MAX_REQUEST_FIELD_KEY_BYTES + 1), "v".to_string());
-        fields.insert(
-            "field_big".to_string(),
-            "v".repeat(MAX_REQUEST_FIELD_VALUE_BYTES + 1),
-        );
-        let encoded = encode_request_fields(&fields);
-        let parsed = decode_request_fields(&encoded).unwrap();
-        assert_eq!(parsed.fields.len(), 1);
-        assert_eq!(parsed.fields.get("ok").map(String::as_str), Some("v"));
-    }
-
-    #[test]
-    fn encode_caps_field_count() {
-        let mut fields = BTreeMap::new();
-        for i in 0..MAX_REQUEST_FIELDS + 10 {
-            fields.insert(format!("field_{i:03}"), "v".to_string());
-        }
-        let encoded = encode_request_fields(&fields);
-        let parsed = decode_request_fields(&encoded).unwrap();
-        assert_eq!(parsed.fields.len(), MAX_REQUEST_FIELDS);
-    }
 
     #[test]
     fn decodes_msgpack_string_map() {

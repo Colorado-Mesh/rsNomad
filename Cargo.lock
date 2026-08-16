@@ -450,7 +450,7 @@ dependencies = [
  "rns-wire",
  "serde",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
 ]
@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "rns-crypto"
-version = "1.1.0"
+version = "1.0.1"
 dependencies = [
  "aes",
  "cbc",
@@ -669,14 +669,14 @@ dependencies = [
  "rand_core",
  "sha2",
  "subtle",
- "thiserror 2.0.20",
+ "thiserror 2.0.19",
  "x25519-dalek",
  "zeroize",
 ]
 
 [[package]]
 name = "rns-identity"
-version = "1.1.0"
+version = "1.0.1"
 dependencies = [
  "hex",
  "rand",
@@ -686,7 +686,7 @@ dependencies = [
  "rns-wire",
  "serde",
  "serde_bytes",
- "thiserror 2.0.20",
+ "thiserror 2.0.19",
  "tracing",
  "windows-sys 0.61.2",
  "zeroize",
@@ -694,14 +694,13 @@ dependencies = [
 
 [[package]]
 name = "rns-interface"
-version = "1.1.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "hex",
  "if-addrs",
  "jni",
  "libc",
- "md-5",
  "objc2",
  "objc2-core-bluetooth",
  "objc2-foundation",
@@ -713,7 +712,7 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2 0.5.10",
- "thiserror 2.0.20",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
  "windows",
@@ -721,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "rns-link"
-version = "1.1.0"
+version = "1.0.1"
 dependencies = [
  "hex",
  "rand",
@@ -729,14 +728,14 @@ dependencies = [
  "rns-crypto",
  "rns-identity",
  "rns-wire",
- "thiserror 2.0.20",
+ "thiserror 2.0.19",
  "tracing",
  "zeroize",
 ]
 
 [[package]]
 name = "rns-protocol"
-version = "1.1.0"
+version = "1.0.1"
 dependencies = [
  "bzip2",
  "hex",
@@ -745,14 +744,14 @@ dependencies = [
  "rns-crypto",
  "rns-link",
  "rns-wire",
- "thiserror 2.0.20",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "rns-runtime"
-version = "1.1.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "hex",
@@ -771,14 +770,14 @@ dependencies = [
  "serde",
  "sha2",
  "subtle",
- "thiserror 2.0.20",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "rns-transport"
-version = "1.1.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "hex",
@@ -790,18 +789,18 @@ dependencies = [
  "rns-wire",
  "serde",
  "subtle",
- "thiserror 2.0.20",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "rns-wire"
-version = "1.1.0"
+version = "1.0.1"
 dependencies = [
  "rns-crypto",
  "sha2",
- "thiserror 2.0.20",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -1018,11 +1017,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
 dependencies = [
- "thiserror-impl 2.0.20",
+ "thiserror-impl 2.0.19",
 ]
 
 [[package]]
@@ -1038,9 +1037,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1066,13 +1065,13 @@ dependencies = [
 
 [[package]]
 name = "tokio-macros"
-version = "2.7.2"
+version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
+checksum = "6328af13490e73a9b4694030fafd93f8c8c6a9dede33e821c3fc63eddf8042ba"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1324,18 +1323,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.56"
+version = "0.8.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb"
+checksum = "b5a105cd7b140f6eeec8acff2ea38135d3cab283ada58540f629fe51e46696eb"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.56"
+version = "0.8.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2ab42fc20575779bd240faa45f94a74256f755c0fa9e89f0ede20d91d0cdfc1"
+checksum = "0fe976fb70c78cd64cccfe3a6fc142244e8a77b70959b30faf9d0ac37ee228eb"
 dependencies = [
  "proc-macro2",
  "quote",
