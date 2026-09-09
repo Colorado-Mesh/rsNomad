@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use rns_identity::identity::Identity;
-use rns_runtime::link_manager::{LinkManager, RequestOutcome, pack_file_name_metadata, register_destination};
+use rns_runtime::link_manager::{
+    LinkManager, RequestOutcome, pack_file_name_metadata, register_destination,
+};
 use rns_transport::messages::TransportMessage;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
