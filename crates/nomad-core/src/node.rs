@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use rns_identity::identity::Identity;
-use rns_runtime::link_manager::{LinkManager, RequestOutcome, register_destination};
+use rns_runtime::link_manager::{
+    LinkManager, RequestOutcome, pack_file_name_metadata, register_destination,
+};
 use rns_transport::messages::TransportMessage;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -35,6 +37,9 @@ const MAX_REQUESTS_PER_WINDOW: u64 = 60;
 const REQUEST_WINDOW: Duration = Duration::from_secs(10);
 /// Timeout for awaited announce sends on the periodic ticker.
 const ANNOUNCE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// NomadNet registers file handlers with `auto_compress = 32_000_000`
+/// (compress responses under this size).
+const FILE_AUTO_COMPRESS_MAX_BYTES: usize = 32_000_000;
 
 /// Configuration for [`NomadNode::spawn`].
 #[derive(Debug, Clone)]
@@ -493,7 +498,16 @@ fn handle_request(shared: &SharedState, path_hash_bytes: [u8; 16]) -> RequestOut
         match shared.store.read_file_route(&route) {
             Ok(bytes) => {
                 shared.stats.file_hits.fetch_add(1, Ordering::Relaxed);
-                RequestOutcome::Reply(bytes)
+                let rel_name = route
+                    .strip_prefix(FILE_PREFIX)
+                    .unwrap_or(route.as_str())
+                    .to_string();
+                let auto_compress = bytes.len() < FILE_AUTO_COMPRESS_MAX_BYTES;
+                RequestOutcome::ReplyFile {
+                    data: bytes,
+                    metadata: Some(pack_file_name_metadata(&rel_name)),
+                    auto_compress,
+                }
             }
             Err(NomadError::NotFound(_)) => {
                 // Files have no Micron 404 body — drop silently (NomadNet parity).
@@ -562,16 +576,46 @@ mod tests {
 
         let file_hash = path_hash("/file/readme.txt");
         match handle_request(&shared, file_hash) {
-            RequestOutcome::Reply(bytes) => {
-                assert_eq!(bytes, b"file-bytes");
+            RequestOutcome::ReplyFile {
+                data,
+                metadata,
+                auto_compress,
+            } => {
+                assert_eq!(data, b"file-bytes");
+                assert!(auto_compress);
+                let meta = metadata.expect("file responses include filename metadata");
+                let value = rmpv::decode::read_value(&mut &meta[..]).unwrap();
+                let map = value.as_map().expect("metadata map");
+                assert_eq!(map[0].0.as_str(), Some("name"));
+                assert_eq!(map[0].1.as_slice(), Some(b"readme.txt".as_slice()));
             }
-            _ => panic!("expected file reply from link request handler"),
+            _ => panic!("expected ReplyFile from link request handler"),
         }
 
         let stats = shared.stats.snapshot();
         assert_eq!(stats.page_hits, 1);
         assert_eq!(stats.file_hits, 1);
         assert_eq!(stats.request_count, 2);
+    }
+
+    #[test]
+    fn file_reply_preserves_nested_relative_name() {
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content(
+            &dir,
+            &[("index.mu", b"> ok\n")],
+            &[("photos/pic.png", b"PNG")],
+        );
+        match handle_request(&shared, path_hash("/file/photos/pic.png")) {
+            RequestOutcome::ReplyFile { metadata, data, .. } => {
+                assert_eq!(data, b"PNG");
+                let meta = metadata.expect("metadata");
+                let value = rmpv::decode::read_value(&mut &meta[..]).unwrap();
+                let map = value.as_map().unwrap();
+                assert_eq!(map[0].1.as_slice(), Some(b"photos/pic.png".as_slice()));
+            }
+            _ => panic!("expected ReplyFile for nested file"),
+        }
     }
 
     #[test]

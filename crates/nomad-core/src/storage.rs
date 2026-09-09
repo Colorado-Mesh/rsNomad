@@ -20,8 +20,8 @@ use crate::paths::{
 
 /// Default max page body (matches mesh-client client limit).
 pub const DEFAULT_MAX_PAGE_BYTES: usize = 512 * 1024;
-/// Default max file body (matches mesh-client client limit).
-pub const DEFAULT_MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
+/// Default max file body (NomadNet `auto_compress = 32_000_000` bound).
+pub const DEFAULT_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
 /// Cap directory walk size to bound enumeration DoS.
 pub const MAX_LISTED_ENTRIES: usize = 10_000;
 /// Cap recursion depth when listing content.
