@@ -157,6 +157,11 @@ impl NomadContentStore {
         read_rel(&self.roots.files_dir, self.roots.max_file_bytes, rel)
     }
 
+    /// Read a media asset from `pages/` using the file size cap (WebP `/media`).
+    pub fn read_media_rel(&self, rel: &str) -> Result<Vec<u8>, NomadError> {
+        read_rel(&self.roots.pages_dir, self.roots.max_file_bytes, rel)
+    }
+
     /// Atomically write a file by content-relative path.
     pub fn write_file_rel(&self, rel: &str, content: &[u8]) -> Result<(), NomadError> {
         write_rel(
