@@ -173,7 +173,7 @@ Mapping:
 
 Paths are resolved under each root without following symlink components; `..`,
 absolute escapes, NUL/backslash, and control characters are rejected. Default
-size caps are **512 KiB** for pages and **4 MiB** for files.
+size caps are **512 KiB** for pages and **32 MiB** for files.
 
 **Trust model:** content directories are trusted local storage. Operators must
 ensure they are not writable by untrusted local users. Symlink components are
@@ -194,6 +194,10 @@ rescan the filesystem — call `reload_routes()` after content CRUD.
   currently ignores the request body (static hosting only)
 - Large responses: use normal `Reply` bytes; `LinkManager` upgrades to a response
   Resource when the packed reply exceeds the Link MDU
+- File responses: `/file/...` uses `ReplyFile` — a response Resource with raw
+  bytes and msgpack metadata `{"name": <relative path>}` (NomadNet `serve_file`
+  parity). Images and other binaries are ordinary files under `files/`; there is
+  no `/image/` route or MIME layer on the wire
 - Announce app data: raw UTF-8 display name, capped at 256 bytes (also accepted
   by mesh-client discovery)
 - Hidden paths: dotfiles and `*.allowed` are not listed or served (NomadNet parity)
@@ -206,7 +210,7 @@ rescan the filesystem — call `reload_routes()` after content CRUD.
 | Area | Current behavior |
 | --- | --- |
 | Static pages | Serve `.mu` (and other text) from `pages/` with 512 KiB default cap |
-| Static files | Serve binaries from `files/` with 4 MiB default cap |
+| Static files | Serve binaries from `files/` with 32 MiB default cap as response Resources with filename metadata |
 | Announce | Startup + periodic + transport reannounce with display name |
 | Form payload decode | Helper only (`decode_request_fields`); not wired into serving |
 | Default index | Placeholder Micron page when `index.mu` is missing |
@@ -236,11 +240,12 @@ Follow-ups (not required for basic hosting):
 1. Optional `nomad-tools` binary (`nomad-serve-rs`) for headless static hosting
 2. Identity-restricted pages (`.mu.allowed` lists) without process execution
 3. Richer Micron helpers / builders
-4. Upstream Resource filename metadata improvements in rsReticulum if needed
-5. Transfer repository ownership to the Ratspeak organization when permissions allow
+4. Transfer repository ownership to the Ratspeak organization when permissions allow
 
-Application-layer CMS, chat rooms, and forums belong in clients such as
-mesh-client, not in this protocol crate.
+Application-layer CMS, chat rooms, forums, LXMF image/file attachments, and
+Micron rendering belong in clients such as mesh-client / rsLXMF, not in this
+protocol crate. Images on Nomad nodes are `/file/...` binaries with Resource
+filename metadata (already implemented).
 
 ## Contributing
 

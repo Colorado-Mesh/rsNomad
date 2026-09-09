@@ -12,6 +12,8 @@ static hosting release used by mesh-client (#613).
 - MessagePack form encode/decode helpers (`encode_request_fields` /
   `decode_request_fields`) with shared size caps (decode not yet wired into
   the built-in serve handler)
+- `/file/...` response Resource filename metadata (`ReplyFile`, NomadNet
+  `serve_file` parity); default file cap 32 MiB
 
 ## Near-term
 
@@ -27,7 +29,6 @@ static hosting release used by mesh-client (#613).
 - Optional `nomad-tools` crate with `nomad-serve-rs` headless binary
 - Wire form/`field_*` bodies into serving when dynamic pages are designed
 - Stronger interop fixtures against Python NomadNet page fetches
-- Resource response filename metadata parity (may require rsReticulum upstream)
 - Async / `spawn_blocking` serve path if LinkManager gains an async handler API
 
 ## Later (application / mesh-client)
@@ -38,12 +39,15 @@ These belong in clients such as mesh-client, not in the protocol crate:
 - Theme and navigation editors
 - NomadNet-style chat room apps
 - Forums and other dynamic Nomad apps
+- LXMF conversation image/file attachments (rsLXMF + mesh-client UI)
+- Nomad browser image preview for `/file/...` rasters
 
 ## Explicit non-goals (v1)
 
 - CGI / executable `.mu` page scripts (arbitrary code execution risk)
 - Embedding hosting inside `rsLXMF`
 - Depending on non-Ratspeak RNS stacks (`nomadnet-rs` / `rns-net`)
+- Server-side MIME/`/image/` routes (images are ordinary `/file/...` binaries)
 
 ## Ownership
 
