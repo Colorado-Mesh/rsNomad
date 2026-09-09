@@ -15,9 +15,15 @@ static hosting release used by mesh-client (#613).
 
 ## Near-term
 
+- **Clients import existing `nomad-core` constants** (mesh-client sidecar still
+  hardcodes `NOMAD_NODE_ASPECT` and page/file size caps that this crate already
+  exports). No rsNomad change required — switch the sidecar to
+  `NOMAD_NODE_ASPECT`, `DEFAULT_MAX_PAGE_BYTES`, and `DEFAULT_MAX_FILE_BYTES`.
 - Optional `nomad-client` crate for shared fetch timeouts / Link query
-  skeleton (mesh-client product policy such as `force_path_refresh` stays in
-  clients)
+  skeleton — add when a **second Rust consumer** appears (e.g. `nomad-tools`)
+  or timeout constants drift and cause bugs. Until then keep timeout math in
+  the sidecar; mesh-client product policy such as `force_path_refresh` stays in
+  clients. TS UI/proxy mirrors remain client-side.
 - Optional `nomad-tools` crate with `nomad-serve-rs` headless binary
 - Wire form/`field_*` bodies into serving when dynamic pages are designed
 - Stronger interop fixtures against Python NomadNet page fetches
