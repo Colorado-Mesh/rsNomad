@@ -19,11 +19,11 @@
 
 ---
 
-rsNomad is a Rust implementation of Nomad Network **static page and file hosting**
+rsNomad is a Rust implementation of Nomad Network **page, file, and media hosting**
 over Reticulum Links. This is not a fork of NomadNet; it is NomadNet page-server
 behavior written in a different language, focused on staying interoperable with
-Python NomadNet and MeshChat. It is not the source-of-truth implementation — do
-not treat it as one.
+Python NomadNet **1.4.1** (PyPI) and MeshChat. It is not the source-of-truth
+implementation — do not treat it as one.
 
 Page hosting uses Reticulum Link request/response on aspect `nomadnetwork.node`.
 It is **not** LXMF messaging; use [rsLXMF](https://github.com/ratspeak/rsLXMF) for
@@ -130,6 +130,7 @@ let node = NomadNode::spawn(
         display_name: "My Node".into(),
         announce_interval: Some(Duration::from_secs(3600)),
         announce_at_start: true,
+        allow_executable_pages: false, // opt-in Unix CGI / executable .allowed
     },
 )
 .await?;
@@ -140,10 +141,10 @@ node.reload_routes()?; // required after content CRUD so new routes are served
 ```
 
 `NomadNode` registers the `nomadnetwork.node` destination, installs a Link
-request handler for `/page/...` and `/file/...`, and announces with the display
-name as raw UTF-8 app data (canonical NomadNet format). The built-in handler
-serves static content only and ignores the request body; use
-`decode_request_fields` if your application needs MessagePack form maps.
+request handler for `/page/...`, `/file/...`, and `/media`, and announces with
+the display name as raw UTF-8 app data (canonical NomadNet format). Form bodies
+are decoded for CGI pages when `allow_executable_pages` is enabled; `/media`
+uses `decode_media_request` (`path` + `key`).
 
 This crate is not published to crates.io. For the full public API (CRUD helpers,
 stats, announce, error types, limits), generate local docs:
@@ -160,7 +161,9 @@ NomadNet-compatible roots:
 <base>/
 |-- pages/
 |   |-- index.mu
-|   `-- docs/help.mu
+|   |-- index.mu.allowed          # optional identity ACL companion
+|   |-- docs/help.mu
+|   `-- header.webp               # in-page images via /media
 `-- files/
     `-- manual.pdf
 ```
@@ -169,20 +172,36 @@ Mapping:
 
 - `pages/index.mu` → `/page/index.mu`
 - `pages/docs/help.mu` → `/page/docs/help.mu`
+- `pages/header.webp` → `/media` request with `path` = `header.webp` (WebP only)
 - `files/manual.pdf` → `/file/manual.pdf`
 
 Paths are resolved under each root without following symlink components; `..`,
 absolute escapes, NUL/backslash, and control characters are rejected. Default
-size caps are **512 KiB** for pages and **32 MiB** for files.
+size caps are **512 KiB** for pages and **32 MiB** for files/media.
 
 **Trust model:** content directories are trusted local storage. Operators must
 ensure they are not writable by untrusted local users. Symlink components are
 rejected; hard links under the same volume are not rejected (a hard-linked file
 inside the root is treated as ordinary content).
 
-Missing `/page/...` routes return a Micron 404 body. Missing `/file/...` routes
-are dropped with no reply (NomadNet parity). Unknown path hashes do **not**
-rescan the filesystem — call `reload_routes()` after content CRUD.
+**ACL (`.allowed`):** a companion file `{resource}.allowed` next to a page,
+file, or media path restricts access to listed identity hashes (32 hex chars
+per line). Missing companion → allow. Paths ending in `.allowed` are never
+served. Deny replies use Micron `not_allowed_page()` for pages/files; media
+denies drop silently. Executable `.allowed` scripts run only when
+`allow_executable_pages` is enabled (same sandbox as CGI); otherwise they are
+read as static lists.
+
+**CGI:** when `allow_executable_pages` is true (default **false**), Unix pages
+with the execute bit are run as processes with a cleared environment
+(`PATH` sanitized, `link_id` / `remote_identity` / `field_*` / `var_*`), ~10s
+timeout, stdout capped to `max_page_bytes`, stderr discarded, no shell.
+Windows never runs CGI. ACL is evaluated before CGI.
+
+Missing `/page/...` routes return a Micron 404 body. Missing `/file/...` and
+bad `/media` requests are dropped with no reply (NomadNet parity). Unknown path
+hashes do **not** rescan the filesystem — call `reload_routes()` after content
+CRUD.
 
 ## Protocol Notes
 
@@ -190,17 +209,19 @@ rescan the filesystem — call `reload_routes()` after content CRUD.
 - Transport: Reticulum encrypted Link request/response (not LXMF)
 - Wire path hash: first 16 bytes of SHA-256 of the exact path string
 - Form data: `decode_request_fields` accepts a MessagePack map of string keys
-  (e.g. `field_*`, `var_*`) with size/depth caps; the built-in serve handler
-  currently ignores the request body (static hosting only)
+  (e.g. `field_*`, `var_*`) with size/depth caps; wired into CGI env when
+  executable pages are enabled
+- Media: `encode_media_request` / `decode_media_request` for `{path, key}`
+  maps (`key` may be Nil); route string exactly `/media`
 - Large responses: use normal `Reply` bytes; `LinkManager` upgrades to a response
   Resource when the packed reply exceeds the Link MDU
-- File responses: `/file/...` uses `ReplyFile` — a response Resource with raw
-  bytes and msgpack metadata `{"name": <relative path>}` (NomadNet `serve_file`
-  parity). Images and other binaries are ordinary files under `files/`; there is
-  no `/image/` route or MIME layer on the wire
+- File / media responses: `ReplyFile` — a response Resource with raw bytes and
+  msgpack metadata `{"name": ...}` (relative path for `/file`, basename for
+  `/media`)
 - Announce app data: raw UTF-8 display name, capped at 256 bytes (also accepted
   by mesh-client discovery)
-- Hidden paths: dotfiles and `*.allowed` are not listed or served (NomadNet parity)
+- Hidden paths: dotfiles and `*.allowed` are not listed or served as content
+  (NomadNet parity); `.allowed` companions are enforced as ACLs
 - Concurrency: in-flight request budget (default 8) plus a fixed-window rate
   limit (default 60 requests / 10 s). The Link request handler runs
   synchronously on the link event loop with bounded disk reads.
@@ -211,23 +232,28 @@ rescan the filesystem — call `reload_routes()` after content CRUD.
 | --- | --- |
 | Static pages | Serve `.mu` (and other text) from `pages/` with 512 KiB default cap |
 | Static files | Serve binaries from `files/` with 32 MiB default cap as response Resources with filename metadata |
+| `/media` WebP | Exact `/media` route; pages-jail WebP only; basename `ReplyFile` metadata |
+| `.allowed` ACL | Static identity-hash lists; optional sandboxed executable companions |
+| CGI pages | Opt-in (`allow_executable_pages`); Unix-only sandbox; default off |
 | Announce | Startup + periodic + transport reannounce with display name |
-| Form payload decode | Helper only (`decode_request_fields`); not wired into serving |
+| Form payload decode | Helpers + CGI env injection when enabled |
 | Default index | Placeholder Micron page when `index.mu` is missing |
-| Path safety | Traversal/symlink rejection, size limits, skip dotfiles/`*.allowed` |
+| Path safety | Traversal/symlink rejection, size limits, skip listing dotfiles/`*.allowed` |
 | Request budget | Bounded in-flight handlers + fixed-window admit limit |
-| CGI / executable pages | **Not implemented** (explicit non-goal for v1) |
 | Markdown CMS | Application concern (e.g. mesh-client UI) — not in this crate |
 | Chat / forums | Roadmap only |
 | `nomad-serve-rs` CLI | Planned (optional tools crate) |
 
 ## Compatibility Notes
 
-Target clients: Python [NomadNet](https://github.com/markqvist/NomadNet) and MeshChat
-browsers, plus [mesh-client](https://github.com/Colorado-Mesh/mesh-client) Nomad tab.
+Target clients: Python [NomadNet](https://github.com/markqvist/NomadNet) **1.4.1**
+and MeshChat browsers, plus [mesh-client](https://github.com/Colorado-Mesh/mesh-client)
+Nomad tab.
 
-v1 focuses on static hosting. Dynamic executable pages (NomadNet CGI-style
-`.mu` scripts) are intentionally omitted for security.
+Compatibility target for hosting behavior is the NomadNet **1.4.1 PyPI sdist**
+(`Node.py`: `serve_page`, `serve_file`, `serve_media`, `request_allowed`).
+CGI is **opt-in** and sandboxed (cleared env); Python inherits the parent
+environment — an intentional hardening difference.
 
 This crate depends on Ratspeak [rsReticulum](https://github.com/ratspeak/rsReticulum)
 path dependencies during development. It is not compatible with unrelated RNS
@@ -238,14 +264,13 @@ Rust stacks (for example TeskesLab `nomadnet-rs` / `rns-net`).
 Follow-ups (not required for basic hosting):
 
 1. Optional `nomad-tools` binary (`nomad-serve-rs`) for headless static hosting
-2. Identity-restricted pages (`.mu.allowed` lists) without process execution
-3. Richer Micron helpers / builders
-4. Transfer repository ownership to the Ratspeak organization when permissions allow
+2. Richer Micron helpers / builders
+3. Transfer repository ownership to the Ratspeak organization when permissions allow
 
 Application-layer CMS, chat rooms, forums, LXMF image/file attachments, and
 Micron rendering belong in clients such as mesh-client / rsLXMF, not in this
-protocol crate. Images on Nomad nodes are `/file/...` binaries with Resource
-filename metadata (already implemented).
+protocol crate. In-page images use `/media` WebP under `pages/`; other binaries
+remain `/file/...` with Resource filename metadata.
 
 ## Contributing
 

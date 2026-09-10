@@ -1,8 +1,7 @@
-//! Encode and decode NomadNet link request payloads (`field_*` / `var_*` MessagePack maps).
+//! Encode and decode NomadNet link request payloads.
 //!
-//! These helpers are available for callers that want to build or interpret form
-//! bodies. The built-in [`crate::NomadNode`] request handler serves static
-//! content only and currently ignores the request body.
+//! Covers form `field_*` / `var_*` MessagePack maps and the `/media` request
+//! body (`path` + `key`) used by NomadNet 1.4.1 in-page WebP fetches.
 
 use std::collections::BTreeMap;
 
@@ -115,6 +114,83 @@ fn value_as_string(value: &rmpv::Value) -> Option<String> {
         rmpv::Value::F64(f) => Some(f.to_string()),
         _ => None,
     }
+}
+
+/// Decoded `/media` request body (`path` required string; `key` present, often Nil).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaRequest {
+    /// Relative media path under `pages/` (may include a `/media/` prefix).
+    pub path: String,
+}
+
+/// Encode a NomadNet `/media` request body: msgpack map `{path, key: nil}`.
+pub fn encode_media_request(path: &str) -> Vec<u8> {
+    let map = vec![
+        (
+            rmpv::Value::String("path".into()),
+            rmpv::Value::String(path.into()),
+        ),
+        (rmpv::Value::String("key".into()), rmpv::Value::Nil),
+    ];
+    let mut buf = Vec::new();
+    if rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(map)).is_err() {
+        return Vec::new();
+    }
+    buf
+}
+
+/// Decode a `/media` request body.
+///
+/// Requires a MessagePack map containing **both** `"path"` (UTF-8 string) and `"key"`
+/// (any value, including Nil). Missing either key, non-map input, or a `path` that is
+/// not a MessagePack string yields [`NomadError::InvalidPath`] (caller should Drop).
+pub fn decode_media_request(data: &[u8]) -> Result<MediaRequest, NomadError> {
+    if data.len() > MAX_REQUEST_BODY_BYTES {
+        return Err(NomadError::TooLarge {
+            size: data.len(),
+            max: MAX_REQUEST_BODY_BYTES,
+        });
+    }
+    let value = rmpv::decode::read_value_with_max_depth(&mut &*data, MAX_REQUEST_MSGPACK_DEPTH)
+        .map_err(|_| NomadError::InvalidPath("media request is not valid msgpack".into()))?;
+    let rmpv::Value::Map(map) = value else {
+        return Err(NomadError::InvalidPath(
+            "media request must be a msgpack map".into(),
+        ));
+    };
+
+    let mut path: Option<String> = None;
+    let mut has_key = false;
+    for (k, v) in map {
+        let Some(name) = value_as_string(&k) else {
+            continue;
+        };
+        match name.as_str() {
+            "path" => {
+                // Strict: only MessagePack strings (reject Binary / bool / int / nil).
+                let rmpv::Value::String(s) = v else {
+                    return Err(NomadError::InvalidPath(
+                        "media request path must be a msgpack string".into(),
+                    ));
+                };
+                let Some(p) = s.as_str().map(str::to_owned) else {
+                    return Err(NomadError::InvalidPath(
+                        "media request path is not valid UTF-8".into(),
+                    ));
+                };
+                path = Some(p);
+            }
+            "key" => has_key = true,
+            _ => {}
+        }
+    }
+    if !has_key {
+        return Err(NomadError::InvalidPath("media request missing key".into()));
+    }
+    let Some(path) = path else {
+        return Err(NomadError::InvalidPath("media request missing path".into()));
+    };
+    Ok(MediaRequest { path })
 }
 
 #[cfg(test)]
@@ -317,5 +393,70 @@ mod tests {
         let parsed = decode_request_fields(&buf).unwrap();
         assert!(parsed.fields.is_empty());
         assert_eq!(parsed.raw, buf);
+    }
+
+    #[test]
+    fn media_request_round_trips_with_nil_key() {
+        let encoded = encode_media_request("header.webp");
+        let parsed = decode_media_request(&encoded).unwrap();
+        assert_eq!(parsed.path, "header.webp");
+    }
+
+    #[test]
+    fn media_request_requires_key_field() {
+        let map = vec![(
+            rmpv::Value::String("path".into()),
+            rmpv::Value::String("a.webp".into()),
+        )];
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(map)).unwrap();
+        let err = decode_media_request(&buf).unwrap_err();
+        assert!(matches!(err, NomadError::InvalidPath(_)));
+    }
+
+    #[test]
+    fn media_request_requires_path_field() {
+        let map = vec![(rmpv::Value::String("key".into()), rmpv::Value::Nil)];
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(map)).unwrap();
+        assert!(decode_media_request(&buf).is_err());
+    }
+
+    #[test]
+    fn media_request_accepts_non_nil_key() {
+        let map = vec![
+            (
+                rmpv::Value::String("path".into()),
+                rmpv::Value::String("a.webp".into()),
+            ),
+            (
+                rmpv::Value::String("key".into()),
+                rmpv::Value::String("unused".into()),
+            ),
+        ];
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(map)).unwrap();
+        assert_eq!(decode_media_request(&buf).unwrap().path, "a.webp");
+    }
+
+    #[test]
+    fn media_request_rejects_non_string_path() {
+        for path_val in [
+            rmpv::Value::Binary(b"a.webp".to_vec()),
+            rmpv::Value::Boolean(true),
+            rmpv::Value::Integer(1.into()),
+            rmpv::Value::Nil,
+        ] {
+            let map = vec![
+                (rmpv::Value::String("path".into()), path_val),
+                (rmpv::Value::String("key".into()), rmpv::Value::Nil),
+            ];
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(map)).unwrap();
+            assert!(
+                decode_media_request(&buf).is_err(),
+                "non-string path must be rejected"
+            );
+        }
     }
 }

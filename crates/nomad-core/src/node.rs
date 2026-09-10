@@ -19,15 +19,22 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::acl::{AclDecision, request_allowed};
 use crate::announce::{
     clamp_node_name, nomad_destination_hash, send_nomad_announce, send_nomad_announce_try,
 };
+#[cfg(unix)]
+use crate::cgi::{is_unix_executable, run_cgi};
 use crate::error::NomadError;
-use crate::micron::not_found_page;
+use crate::micron::{not_allowed_page, not_found_page};
 use crate::paths::{
-    DEFAULT_INDEX_ROUTE, FILE_PREFIX, NOMAD_NODE_ASPECT, PAGE_PREFIX, normalize_file_route,
-    normalize_page_route, path_hash,
+    DEFAULT_INDEX_ROUTE, FILE_PREFIX, MEDIA_ROUTE, NOMAD_NODE_ASPECT, PAGE_PREFIX,
+    normalize_file_route, normalize_page_route, path_hash, resolve_under_root, strip_file_prefix,
+    strip_page_prefix,
 };
+use crate::request::decode_media_request;
+#[cfg(unix)]
+use crate::request::decode_request_fields;
 use crate::storage::NomadContentStore;
 
 /// Max concurrent request handlers (disk/network budget).
@@ -50,6 +57,9 @@ pub struct NomadNodeConfig {
     pub announce_interval: Option<Duration>,
     /// Send an announce immediately after spawn.
     pub announce_at_start: bool,
+    /// When true (Unix only), serve `+x` pages via sandboxed CGI and allow
+    /// executable `.allowed` companions. Default off for security.
+    pub allow_executable_pages: bool,
 }
 
 impl Default for NomadNodeConfig {
@@ -58,6 +68,7 @@ impl Default for NomadNodeConfig {
             display_name: "Nomad node".into(),
             announce_interval: Some(Duration::from_secs(3600)),
             announce_at_start: true,
+            allow_executable_pages: false,
         }
     }
 }
@@ -71,6 +82,8 @@ pub struct NomadServeStats {
     pub page_hits: u64,
     /// Successful file replies.
     pub file_hits: u64,
+    /// Successful `/media` replies.
+    pub media_hits: u64,
     /// Missing routes / missing content.
     pub not_found_count: u64,
     /// Wall-clock ms of the last admitted request, if any.
@@ -117,6 +130,8 @@ fn rebuild_routes(routes: &mut RouteTable, store: &NomadContentStore) -> Result<
     }
     // Always register index even if list was empty before ensure.
     routes.register(DEFAULT_INDEX_ROUTE.into())?;
+    // Exact `/media` route (NomadNet 1.4.1 in-page WebP).
+    routes.register(MEDIA_ROUTE.into())?;
     Ok(())
 }
 
@@ -126,6 +141,7 @@ struct SharedState {
     routes: RwLock<RouteTable>,
     stats: NomadServeStatsInner,
     budget: RequestBudget,
+    allow_executable_pages: bool,
 }
 
 struct RequestBudgetState {
@@ -190,6 +206,7 @@ struct NomadServeStatsInner {
     request_count: AtomicU64,
     page_hits: AtomicU64,
     file_hits: AtomicU64,
+    media_hits: AtomicU64,
     not_found_count: AtomicU64,
     last_request_ms: AtomicU64,
 }
@@ -200,6 +217,7 @@ impl NomadServeStatsInner {
             request_count: AtomicU64::new(0),
             page_hits: AtomicU64::new(0),
             file_hits: AtomicU64::new(0),
+            media_hits: AtomicU64::new(0),
             not_found_count: AtomicU64::new(0),
             last_request_ms: AtomicU64::new(0),
         }
@@ -211,6 +229,7 @@ impl NomadServeStatsInner {
             request_count: self.request_count.load(Ordering::Relaxed),
             page_hits: self.page_hits.load(Ordering::Relaxed),
             file_hits: self.file_hits.load(Ordering::Relaxed),
+            media_hits: self.media_hits.load(Ordering::Relaxed),
             not_found_count: self.not_found_count.load(Ordering::Relaxed),
             last_request_ms: if last == 0 { None } else { Some(last) },
         }
@@ -259,6 +278,7 @@ impl NomadNode {
             routes: RwLock::new(RouteTable::new()),
             stats: NomadServeStatsInner::new(),
             budget: RequestBudget::new(),
+            allow_executable_pages: config.allow_executable_pages,
         });
 
         // Pre-register known filesystem pages/files for path-hash lookup.
@@ -283,10 +303,8 @@ impl NomadNode {
         );
 
         let handler_shared = shared.clone();
-        // Request body (`_data`) is ignored: static hosting only. Callers that
-        // need form fields should decode with `decode_request_fields` themselves.
-        link_mgr.set_request_handler_ex(move |_link_id, path_hash, _data| {
-            handle_request(&handler_shared, path_hash)
+        link_mgr.set_request_handler_ex(move |link_id, path_hash, data, remote_identity| {
+            handle_request(&handler_shared, link_id, path_hash, data, remote_identity)
         });
 
         let announce_tx = transport_tx.clone();
@@ -452,7 +470,13 @@ fn lookup_route(shared: &SharedState, path_hash_bytes: [u8; 16]) -> Option<Strin
     routes.by_hash.get(&path_hash_bytes).cloned()
 }
 
-fn handle_request(shared: &SharedState, path_hash_bytes: [u8; 16]) -> RequestOutcome {
+fn handle_request(
+    shared: &SharedState,
+    link_id: [u8; 16],
+    path_hash_bytes: [u8; 16],
+    data: Vec<u8>,
+    remote_identity: Option<Identity>,
+) -> RequestOutcome {
     let Some(_budget) = shared.budget.try_acquire() else {
         tracing::warn!("nomad request budget exceeded; dropping request");
         return RequestOutcome::Drop;
@@ -479,54 +503,218 @@ fn handle_request(shared: &SharedState, path_hash_bytes: [u8; 16]) -> RequestOut
         return RequestOutcome::Reply(not_found_page("/page/unknown").into_bytes());
     };
 
+    if route == MEDIA_ROUTE {
+        return serve_media(shared, &data, remote_identity.as_ref());
+    }
+
     if route.starts_with(PAGE_PREFIX) {
-        match shared.store.read_page_route(&route) {
-            Ok(bytes) => {
-                shared.stats.page_hits.fetch_add(1, Ordering::Relaxed);
-                RequestOutcome::Reply(bytes)
-            }
-            Err(NomadError::NotFound(_)) => {
-                shared.stats.not_found_count.fetch_add(1, Ordering::Relaxed);
-                RequestOutcome::Reply(not_found_page(&route).into_bytes())
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, route = %route, "nomad page serve failed");
-                RequestOutcome::Drop
-            }
-        }
+        serve_page(shared, &route, link_id, &data, remote_identity.as_ref())
     } else if route.starts_with(FILE_PREFIX) {
-        match shared.store.read_file_route(&route) {
-            Ok(bytes) => {
-                shared.stats.file_hits.fetch_add(1, Ordering::Relaxed);
-                let rel_name = route
-                    .strip_prefix(FILE_PREFIX)
-                    .unwrap_or(route.as_str())
-                    .to_string();
-                let auto_compress = bytes.len() < FILE_AUTO_COMPRESS_MAX_BYTES;
-                RequestOutcome::ReplyFile {
-                    data: bytes,
-                    metadata: Some(pack_file_name_metadata(&rel_name)),
-                    auto_compress,
-                }
-            }
-            Err(NomadError::NotFound(_)) => {
-                // Files have no Micron 404 body — drop silently (NomadNet parity).
-                shared.stats.not_found_count.fetch_add(1, Ordering::Relaxed);
-                RequestOutcome::Drop
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, route = %route, "nomad file serve failed");
-                RequestOutcome::Drop
-            }
-        }
+        serve_file(shared, &route, remote_identity.as_ref())
     } else {
         RequestOutcome::Drop
+    }
+}
+
+fn deny_pages_or_files() -> RequestOutcome {
+    RequestOutcome::Reply(not_allowed_page().as_bytes().to_vec())
+}
+
+fn serve_page(
+    shared: &SharedState,
+    route: &str,
+    link_id: [u8; 16],
+    data: &[u8],
+    remote_identity: Option<&Identity>,
+) -> RequestOutcome {
+    let rel = match strip_page_prefix(route) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, route = %route, "invalid page route");
+            return RequestOutcome::Drop;
+        }
+    };
+    let abs = match resolve_under_root(&shared.store.roots().pages_dir, rel) {
+        Ok(p) => p,
+        Err(NomadError::NotFound(_)) | Err(NomadError::PathTraversal) => {
+            shared.stats.not_found_count.fetch_add(1, Ordering::Relaxed);
+            return RequestOutcome::Reply(not_found_page(route).into_bytes());
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, route = %route, "page path resolve failed");
+            return RequestOutcome::Drop;
+        }
+    };
+
+    if request_allowed(&abs, remote_identity, shared.allow_executable_pages) == AclDecision::Deny {
+        return deny_pages_or_files();
+    }
+
+    #[cfg(unix)]
+    if shared.allow_executable_pages && is_unix_executable(&abs) {
+        // LinkManager request handlers must return RequestOutcome synchronously
+        // (no deferred-reply API). CGI therefore runs inline with a process-group
+        // timeout in `run_cgi`; moving this off-thread without dropping the reply
+        // requires rsReticulum support.
+        let fields = decode_request_fields(data)
+            .map(|f| f.fields)
+            .unwrap_or_default();
+        let max = shared.store.roots().max_page_bytes;
+        match run_cgi(&abs, link_id, remote_identity, &fields, max) {
+            Ok(bytes) => {
+                shared.stats.page_hits.fetch_add(1, Ordering::Relaxed);
+                return RequestOutcome::Reply(bytes);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, route = %route, "nomad CGI page failed");
+                return RequestOutcome::Drop;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (link_id, data);
+    }
+
+    match shared.store.read_page_route(route) {
+        Ok(bytes) => {
+            shared.stats.page_hits.fetch_add(1, Ordering::Relaxed);
+            RequestOutcome::Reply(bytes)
+        }
+        Err(NomadError::NotFound(_)) => {
+            shared.stats.not_found_count.fetch_add(1, Ordering::Relaxed);
+            RequestOutcome::Reply(not_found_page(route).into_bytes())
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, route = %route, "nomad page serve failed");
+            RequestOutcome::Drop
+        }
+    }
+}
+
+fn serve_file(
+    shared: &SharedState,
+    route: &str,
+    remote_identity: Option<&Identity>,
+) -> RequestOutcome {
+    let rel = match strip_file_prefix(route) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, route = %route, "invalid file route");
+            return RequestOutcome::Drop;
+        }
+    };
+    let abs = match resolve_under_root(&shared.store.roots().files_dir, rel) {
+        Ok(p) => p,
+        Err(NomadError::NotFound(_)) | Err(NomadError::PathTraversal) => {
+            shared.stats.not_found_count.fetch_add(1, Ordering::Relaxed);
+            return RequestOutcome::Drop;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, route = %route, "file path resolve failed");
+            return RequestOutcome::Drop;
+        }
+    };
+
+    if request_allowed(&abs, remote_identity, shared.allow_executable_pages) == AclDecision::Deny {
+        return deny_pages_or_files();
+    }
+
+    match shared.store.read_file_route(route) {
+        Ok(bytes) => {
+            shared.stats.file_hits.fetch_add(1, Ordering::Relaxed);
+            let rel_name = route.strip_prefix(FILE_PREFIX).unwrap_or(route).to_string();
+            let auto_compress = bytes.len() < FILE_AUTO_COMPRESS_MAX_BYTES;
+            RequestOutcome::ReplyFile {
+                data: bytes,
+                metadata: Some(pack_file_name_metadata(&rel_name)),
+                auto_compress,
+            }
+        }
+        Err(NomadError::NotFound(_)) => {
+            // Files have no Micron 404 body — drop silently (NomadNet parity).
+            shared.stats.not_found_count.fetch_add(1, Ordering::Relaxed);
+            RequestOutcome::Drop
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, route = %route, "nomad file serve failed");
+            RequestOutcome::Drop
+        }
+    }
+}
+
+fn serve_media(
+    shared: &SharedState,
+    data: &[u8],
+    remote_identity: Option<&Identity>,
+) -> RequestOutcome {
+    let media = match decode_media_request(data) {
+        Ok(m) => m,
+        Err(_) => return RequestOutcome::Drop,
+    };
+
+    let rel = media
+        .path
+        .trim()
+        .strip_prefix("/media/")
+        .unwrap_or(media.path.trim())
+        .trim_start_matches('/');
+    if rel.is_empty() {
+        return RequestOutcome::Drop;
+    }
+
+    let basename = std::path::Path::new(rel)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let ext_ok = std::path::Path::new(basename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("webp"));
+    if !ext_ok {
+        return RequestOutcome::Drop;
+    }
+
+    let abs = match resolve_under_root(&shared.store.roots().pages_dir, rel) {
+        Ok(p) => p,
+        Err(_) => return RequestOutcome::Drop,
+    };
+
+    // NomadNet checks absolute path length ≤ 512.
+    if abs.to_string_lossy().len() > 512 {
+        return RequestOutcome::Drop;
+    }
+
+    if request_allowed(&abs, remote_identity, shared.allow_executable_pages) == AclDecision::Deny {
+        return RequestOutcome::Drop;
+    }
+
+    match shared.store.read_media_rel(rel) {
+        Ok(bytes) => {
+            shared.stats.media_hits.fetch_add(1, Ordering::Relaxed);
+            let auto_compress = bytes.len() < FILE_AUTO_COMPRESS_MAX_BYTES;
+            RequestOutcome::ReplyFile {
+                data: bytes,
+                metadata: Some(pack_file_name_metadata(basename)),
+                auto_compress,
+            }
+        }
+        Err(NomadError::TooLarge { .. }) => RequestOutcome::Drop,
+        Err(NomadError::NotFound(_)) => {
+            shared.stats.not_found_count.fetch_add(1, Ordering::Relaxed);
+            RequestOutcome::Drop
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %rel, "nomad media serve failed");
+            RequestOutcome::Drop
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request::encode_media_request;
     use crate::storage::NomadContentRoots;
     use rns_runtime::link_manager::RequestOutcome;
     use tempfile::TempDir;
@@ -535,6 +723,15 @@ mod tests {
         dir: &TempDir,
         pages: &[(&str, &[u8])],
         files: &[(&str, &[u8])],
+    ) -> Arc<SharedState> {
+        shared_with_content_opts(dir, pages, files, false)
+    }
+
+    fn shared_with_content_opts(
+        dir: &TempDir,
+        pages: &[(&str, &[u8])],
+        files: &[(&str, &[u8])],
+        allow_executable_pages: bool,
     ) -> Arc<SharedState> {
         let store = NomadContentStore::new(NomadContentRoots::under(dir.path())).unwrap();
         for (path, body) in pages {
@@ -549,12 +746,28 @@ mod tests {
             routes: RwLock::new(RouteTable::new()),
             stats: NomadServeStatsInner::new(),
             budget: RequestBudget::new(),
+            allow_executable_pages,
         });
         {
             let mut routes = shared.routes.write().unwrap();
             rebuild_routes(&mut routes, &shared.store).unwrap();
         }
         shared
+    }
+
+    fn call(
+        shared: &SharedState,
+        route_hash: [u8; 16],
+        data: Vec<u8>,
+        remote: Option<Identity>,
+    ) -> RequestOutcome {
+        handle_request(shared, [0u8; 16], route_hash, data, remote)
+    }
+
+    fn identity_with_hash(hash: [u8; 16]) -> Identity {
+        let mut id = Identity::new();
+        id.hash = hash;
+        id
     }
 
     #[test]
@@ -567,7 +780,7 @@ mod tests {
         );
 
         let page_hash = path_hash("/page/index.mu");
-        match handle_request(&shared, page_hash) {
+        match call(&shared, page_hash, Vec::new(), None) {
             RequestOutcome::Reply(bytes) => {
                 assert_eq!(bytes, b"> Hello from host\n");
             }
@@ -575,7 +788,7 @@ mod tests {
         }
 
         let file_hash = path_hash("/file/readme.txt");
-        match handle_request(&shared, file_hash) {
+        match call(&shared, file_hash, Vec::new(), None) {
             RequestOutcome::ReplyFile {
                 data,
                 metadata,
@@ -606,7 +819,7 @@ mod tests {
             &[("index.mu", b"> ok\n")],
             &[("photos/pic.png", b"PNG")],
         );
-        match handle_request(&shared, path_hash("/file/photos/pic.png")) {
+        match call(&shared, path_hash("/file/photos/pic.png"), Vec::new(), None) {
             RequestOutcome::ReplyFile { metadata, data, .. } => {
                 assert_eq!(data, b"PNG");
                 let meta = metadata.expect("metadata");
@@ -625,7 +838,7 @@ mod tests {
         let before = shared.routes.read().unwrap().by_hash.len();
         assert!(before >= 1);
 
-        match handle_request(&shared, [0u8; 16]) {
+        match call(&shared, [0u8; 16], Vec::new(), None) {
             RequestOutcome::Reply(bytes) => {
                 let body = String::from_utf8_lossy(&bytes);
                 assert!(body.contains("Not found"));
@@ -636,8 +849,7 @@ mod tests {
         let after = shared.routes.read().unwrap().by_hash.len();
         assert_eq!(before, after, "soft-miss must not wipe the route table");
 
-        // Registered page still serves without requiring a rebuild.
-        match handle_request(&shared, path_hash("/page/index.mu")) {
+        match call(&shared, path_hash("/page/index.mu"), Vec::new(), None) {
             RequestOutcome::Reply(bytes) => assert_eq!(bytes, b"> ok\n"),
             _ => panic!("expected page reply after unknown-hash miss"),
         }
@@ -651,7 +863,7 @@ mod tests {
             let mut routes = shared.routes.write().unwrap();
             routes.register("/file/gone.bin".into()).unwrap();
         }
-        match handle_request(&shared, path_hash("/file/gone.bin")) {
+        match call(&shared, path_hash("/file/gone.bin"), Vec::new(), None) {
             RequestOutcome::Drop => {}
             _ => panic!("expected Drop for missing file"),
         }
@@ -680,8 +892,6 @@ mod tests {
     fn request_budget_bounds_window_count() {
         let budget = RequestBudget::new();
         for _ in 0..MAX_REQUESTS_PER_WINDOW {
-            // Drop immediately so in-flight stays under the concurrency cap;
-            // window_count still accumulates for the fixed window.
             assert!(budget.try_acquire().is_some());
         }
         assert!(budget.try_acquire().is_none(), "must reject over window");
@@ -691,9 +901,8 @@ mod tests {
     fn link_request_handler_skips_unregistered_dotfile_routes() {
         let dir = TempDir::new().unwrap();
         let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n")], &[]);
-        // Forbidden routes are not registered; handler returns the not-found Micron page.
         let forbidden = path_hash("/page/.secret.mu");
-        match handle_request(&shared, forbidden) {
+        match call(&shared, forbidden, Vec::new(), None) {
             RequestOutcome::Reply(bytes) => {
                 let body = String::from_utf8_lossy(&bytes);
                 assert!(body.contains("Not found"));
@@ -712,8 +921,7 @@ mod tests {
             .store
             .write_page_rel("extra.mu", b"> extra\n")
             .unwrap();
-        // Not registered yet.
-        match handle_request(&shared, path_hash("/page/extra.mu")) {
+        match call(&shared, path_hash("/page/extra.mu"), Vec::new(), None) {
             RequestOutcome::Reply(bytes) => {
                 assert!(String::from_utf8_lossy(&bytes).contains("Not found"));
             }
@@ -723,7 +931,7 @@ mod tests {
             let mut routes = shared.routes.write().unwrap();
             rebuild_routes(&mut routes, &shared.store).unwrap();
         }
-        match handle_request(&shared, path_hash("/page/extra.mu")) {
+        match call(&shared, path_hash("/page/extra.mu"), Vec::new(), None) {
             RequestOutcome::Reply(bytes) => assert_eq!(bytes, b"> extra\n"),
             _ => panic!("expected reply after reload"),
         }
@@ -803,5 +1011,264 @@ mod tests {
             *guard = clamp_node_name("recovered");
         }
         assert_eq!(shared_display_name(&shared), "recovered");
+    }
+
+    #[test]
+    fn media_route_is_registered() {
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n")], &[]);
+        assert_eq!(
+            lookup_route(&shared, path_hash(MEDIA_ROUTE)).as_deref(),
+            Some(MEDIA_ROUTE)
+        );
+    }
+
+    #[test]
+    fn media_serves_webp_with_basename_metadata() {
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content(
+            &dir,
+            &[("index.mu", b"> ok\n"), ("img/Hero.WEBP", b"RIFFWEBP")],
+            &[],
+        );
+        let body = encode_media_request("/media/img/Hero.WEBP");
+        match call(&shared, path_hash(MEDIA_ROUTE), body, None) {
+            RequestOutcome::ReplyFile {
+                data,
+                metadata,
+                auto_compress,
+            } => {
+                assert_eq!(data, b"RIFFWEBP");
+                assert!(auto_compress);
+                let meta = metadata.expect("basename metadata");
+                let value = rmpv::decode::read_value(&mut &meta[..]).unwrap();
+                let map = value.as_map().unwrap();
+                assert_eq!(map[0].1.as_slice(), Some(b"Hero.WEBP".as_slice()));
+            }
+            other => panic!("expected ReplyFile, got {other:?}"),
+        }
+        assert_eq!(shared.stats.media_hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn media_missing_key_drops() {
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n"), ("a.webp", b"x")], &[]);
+        let map = vec![(
+            rmpv::Value::String("path".into()),
+            rmpv::Value::String("a.webp".into()),
+        )];
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(map)).unwrap();
+        match call(&shared, path_hash(MEDIA_ROUTE), buf, None) {
+            RequestOutcome::Drop => {}
+            _ => panic!("expected Drop when key missing"),
+        }
+    }
+
+    #[test]
+    fn media_rejects_non_webp() {
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n"), ("a.png", b"PNG")], &[]);
+        let body = encode_media_request("a.png");
+        match call(&shared, path_hash(MEDIA_ROUTE), body, None) {
+            RequestOutcome::Drop => {}
+            _ => panic!("expected Drop for non-webp"),
+        }
+    }
+
+    #[test]
+    fn allowed_denies_anonymous_page_with_not_allowed_body() {
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content(
+            &dir,
+            &[("index.mu", b"> ok\n"), ("secret.mu", b"> no\n")],
+            &[],
+        );
+        let hash = [0x42u8; 16];
+        std::fs::write(
+            dir.path().join("pages/secret.mu.allowed"),
+            format!("{}\n", hex::encode(hash)),
+        )
+        .unwrap();
+        match call(&shared, path_hash("/page/secret.mu"), Vec::new(), None) {
+            RequestOutcome::Reply(bytes) => {
+                let body = String::from_utf8_lossy(&bytes);
+                assert!(body.contains("Request Not Allowed"));
+            }
+            _ => panic!("expected not-allowed micron"),
+        }
+        match call(
+            &shared,
+            path_hash("/page/secret.mu"),
+            Vec::new(),
+            Some(identity_with_hash(hash)),
+        ) {
+            RequestOutcome::Reply(bytes) => assert_eq!(bytes, b"> no\n"),
+            _ => panic!("expected allow for listed identity"),
+        }
+    }
+
+    #[test]
+    fn allowed_denies_file_with_not_allowed_body() {
+        let dir = TempDir::new().unwrap();
+        let shared =
+            shared_with_content(&dir, &[("index.mu", b"> ok\n")], &[("secret.bin", b"ABC")]);
+        let hash = [0x7au8; 16];
+        std::fs::write(
+            dir.path().join("files/secret.bin.allowed"),
+            format!("{}\n", hex::encode(hash)),
+        )
+        .unwrap();
+        match call(&shared, path_hash("/file/secret.bin"), Vec::new(), None) {
+            RequestOutcome::Reply(bytes) => {
+                assert!(String::from_utf8_lossy(&bytes).contains("Request Not Allowed"));
+            }
+            _ => panic!("expected not-allowed micron for file deny"),
+        }
+    }
+
+    #[test]
+    fn media_acl_deny_drops() {
+        let dir = TempDir::new().unwrap();
+        let shared =
+            shared_with_content(&dir, &[("index.mu", b"> ok\n"), ("lock.webp", b"W")], &[]);
+        let hash = [0x99u8; 16];
+        std::fs::write(
+            dir.path().join("pages/lock.webp.allowed"),
+            format!("{}\n", hex::encode(hash)),
+        )
+        .unwrap();
+        let body = encode_media_request("lock.webp");
+        match call(&shared, path_hash(MEDIA_ROUTE), body, None) {
+            RequestOutcome::Drop => {}
+            _ => panic!("media ACL deny must Drop"),
+        }
+        let body = encode_media_request("lock.webp");
+        match call(
+            &shared,
+            path_hash(MEDIA_ROUTE),
+            body,
+            Some(identity_with_hash(hash)),
+        ) {
+            RequestOutcome::ReplyFile { data, .. } => assert_eq!(data, b"W"),
+            _ => panic!("listed identity must receive media"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cgi_off_serves_executable_page_as_static() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n")], &[]);
+        let script = dir.path().join("pages/dyn.mu");
+        std::fs::write(&script, b"#!/bin/sh\necho SHOULD_NOT_RUN\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        {
+            let mut routes = shared.routes.write().unwrap();
+            rebuild_routes(&mut routes, &shared.store).unwrap();
+        }
+        match call(&shared, path_hash("/page/dyn.mu"), Vec::new(), None) {
+            RequestOutcome::Reply(bytes) => {
+                assert_eq!(bytes, b"#!/bin/sh\necho SHOULD_NOT_RUN\n");
+            }
+            _ => panic!("CGI off must read static bytes"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cgi_on_runs_executable_page_with_fields() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content_opts(&dir, &[("index.mu", b"> ok\n")], &[], true);
+        let script = dir.path().join("pages/dyn.mu");
+        std::fs::write(&script, b"#!/bin/sh\nprintf '> %s\\n' \"$field_q\"\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        {
+            let mut routes = shared.routes.write().unwrap();
+            rebuild_routes(&mut routes, &shared.store).unwrap();
+        }
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("field_q".into(), "cgi-ok".into());
+        let data = crate::request::encode_request_fields(&fields);
+        match call(&shared, path_hash("/page/dyn.mu"), data, None) {
+            RequestOutcome::Reply(bytes) => {
+                assert_eq!(bytes, b"> cgi-ok\n");
+            }
+            other => panic!("expected CGI stdout reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acl_runs_before_cgi() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content_opts(&dir, &[("index.mu", b"> ok\n")], &[], true);
+        let script = dir.path().join("pages/dyn.mu");
+        std::fs::write(&script, b"#!/bin/sh\necho ran\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        let hash = [0x55u8; 16];
+        std::fs::write(
+            dir.path().join("pages/dyn.mu.allowed"),
+            format!("{}\n", hex::encode(hash)),
+        )
+        .unwrap();
+        {
+            let mut routes = shared.routes.write().unwrap();
+            rebuild_routes(&mut routes, &shared.store).unwrap();
+        }
+        match call(&shared, path_hash("/page/dyn.mu"), Vec::new(), None) {
+            RequestOutcome::Reply(bytes) => {
+                assert!(String::from_utf8_lossy(&bytes).contains("Request Not Allowed"));
+            }
+            _ => panic!("ACL must deny before CGI"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn executable_allowed_runs_when_cgi_enabled() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content_opts(
+            &dir,
+            &[("index.mu", b"> ok\n"), ("gate.mu", b"> in\n")],
+            &[],
+            true,
+        );
+        let hash = [0x66u8; 16];
+        let allowed = dir.path().join("pages/gate.mu.allowed");
+        std::fs::write(
+            &allowed,
+            format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", hex::encode(hash)),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&allowed).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&allowed, perms).unwrap();
+        match call(
+            &shared,
+            path_hash("/page/gate.mu"),
+            Vec::new(),
+            Some(identity_with_hash(hash)),
+        ) {
+            RequestOutcome::Reply(bytes) => assert_eq!(bytes, b"> in\n"),
+            other => panic!("expected allow via executable .allowed, got {other:?}"),
+        }
+        match call(&shared, path_hash("/page/gate.mu"), Vec::new(), None) {
+            RequestOutcome::Reply(bytes) => {
+                assert!(String::from_utf8_lossy(&bytes).contains("Request Not Allowed"));
+            }
+            _ => panic!("anonymous must still be denied"),
+        }
     }
 }

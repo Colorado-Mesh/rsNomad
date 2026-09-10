@@ -48,6 +48,13 @@ pub fn not_found_page(route: &str) -> String {
     )
 }
 
+/// Micron body matching Python NomadNet `DEFAULT_NOTALLOWED` (ACL deny).
+pub fn not_allowed_page() -> &'static str {
+    ">Request Not Allowed\n\
+     \n\
+     You are not authorised to carry out the request.\n"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +90,12 @@ mod tests {
         let out = sanitize_micron_text(&input);
         assert_eq!(out.chars().count(), MAX_MICRON_TEXT_CHARS);
         assert!(out.is_char_boundary(out.len()));
+    }
+
+    #[test]
+    fn not_allowed_matches_python_default() {
+        let page = not_allowed_page();
+        assert!(page.starts_with(">Request Not Allowed"));
+        assert!(page.contains("You are not authorised to carry out the request."));
     }
 }

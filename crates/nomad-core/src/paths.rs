@@ -18,6 +18,8 @@ pub const MAX_REL_PATH_BYTES: usize = 1024;
 pub const PAGE_PREFIX: &str = "/page/";
 /// Wire prefix for file routes.
 pub const FILE_PREFIX: &str = "/file/";
+/// Exact wire route for in-page WebP media (NomadNet 1.4.1 `/media`).
+pub const MEDIA_ROUTE: &str = "/media";
 /// Default page registered when the pages tree is empty.
 pub const DEFAULT_INDEX_ROUTE: &str = "/page/index.mu";
 
@@ -283,6 +285,7 @@ mod tests {
     fn path_hash_is_truncated_sha256() {
         let h = path_hash("/page/index.mu");
         assert_eq!(h, truncated_hash(b"/page/index.mu"));
+        assert_eq!(path_hash(MEDIA_ROUTE), truncated_hash(b"/media"));
     }
 
     #[test]
