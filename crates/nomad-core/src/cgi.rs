@@ -36,6 +36,9 @@ pub fn is_unix_executable(_path: &Path) -> bool {
 /// Sets only `PATH` (sanitized), optional `link_id` / `remote_identity` hex, and
 /// `field_*` / `var_*` entries from `fields`. Captures stdout (capped), discards
 /// stderr, uses no shell, and enforces [`CGI_TIMEOUT`].
+///
+/// The child is placed in its own process group so timeouts / completion can
+/// signal the whole tree (descendants cannot hold the stdout pipe open).
 #[cfg(unix)]
 pub fn run_cgi(
     script: &Path,
@@ -80,6 +83,8 @@ fn run_sandboxed(
     fields: &BTreeMap<String, String>,
     max_stdout: usize,
 ) -> Result<Vec<u8>, NomadError> {
+    use std::os::unix::process::CommandExt;
+
     if !script.is_file() {
         return Err(NomadError::NotFound(script.display().to_string()));
     }
@@ -102,8 +107,11 @@ fn run_sandboxed(
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::null());
+    // New process group (pgid == child pid) so we can kill descendants on exit/timeout.
+    command.process_group(0);
 
     let mut child = command.spawn().map_err(NomadError::Io)?;
+    let child_pid = child.id();
     let mut stdout = child
         .stdout
         .take()
@@ -116,8 +124,13 @@ fn run_sandboxed(
     });
 
     let status = match wait_with_timeout(&mut child, CGI_TIMEOUT) {
-        Ok(status) => status,
+        Ok(status) => {
+            // Child already reaped by try_wait; kill any descendants still holding pipes.
+            terminate_process_group(child_pid);
+            status
+        }
         Err(e) => {
+            terminate_process_group(child_pid);
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader.join();
@@ -146,6 +159,18 @@ fn run_sandboxed(
         );
     }
     Ok(buf)
+}
+
+/// Signal the child's process group (negative pid), then best-effort reap.
+#[cfg(unix)]
+fn terminate_process_group(child_pid: u32) {
+    let pid = child_pid as i32;
+    if pid > 0 {
+        // SAFETY: killpg with the child's pgid (set via process_group(0)).
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -214,6 +239,24 @@ mod tests {
         std::fs::set_permissions(&script, perms).unwrap();
         let err = run_cgi(&script, [0u8; 16], None, &BTreeMap::new(), 8).unwrap_err();
         assert!(matches!(err, NomadError::TooLarge { .. }));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cgi_kills_process_group_on_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("hang.mu");
+        // Child sleeps past CGI_TIMEOUT; process group kill must reclaim it.
+        std::fs::write(&script, b"#!/bin/sh\nsleep 60\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        let err = run_cgi(&script, [0u8; 16], None, &BTreeMap::new(), 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected timeout, got {err}"
+        );
     }
 
     #[test]

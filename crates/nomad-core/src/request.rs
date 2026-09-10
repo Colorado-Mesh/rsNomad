@@ -141,9 +141,9 @@ pub fn encode_media_request(path: &str) -> Vec<u8> {
 
 /// Decode a `/media` request body.
 ///
-/// Requires a MessagePack map containing **both** `"path"` (string) and `"key"`
-/// (any value, including Nil). Missing either key, non-map input, or a non-string
-/// `path` yields [`NomadError::InvalidPath`] (caller should Drop).
+/// Requires a MessagePack map containing **both** `"path"` (UTF-8 string) and `"key"`
+/// (any value, including Nil). Missing either key, non-map input, or a `path` that is
+/// not a MessagePack string yields [`NomadError::InvalidPath`] (caller should Drop).
 pub fn decode_media_request(data: &[u8]) -> Result<MediaRequest, NomadError> {
     if data.len() > MAX_REQUEST_BODY_BYTES {
         return Err(NomadError::TooLarge {
@@ -167,9 +167,15 @@ pub fn decode_media_request(data: &[u8]) -> Result<MediaRequest, NomadError> {
         };
         match name.as_str() {
             "path" => {
-                let Some(p) = value_as_string(&v) else {
+                // Strict: only MessagePack strings (reject Binary / bool / int / nil).
+                let rmpv::Value::String(s) = v else {
                     return Err(NomadError::InvalidPath(
-                        "media request path must be a string".into(),
+                        "media request path must be a msgpack string".into(),
+                    ));
+                };
+                let Some(p) = s.as_str().map(str::to_owned) else {
+                    return Err(NomadError::InvalidPath(
+                        "media request path is not valid UTF-8".into(),
                     ));
                 };
                 path = Some(p);
@@ -431,5 +437,26 @@ mod tests {
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(map)).unwrap();
         assert_eq!(decode_media_request(&buf).unwrap().path, "a.webp");
+    }
+
+    #[test]
+    fn media_request_rejects_non_string_path() {
+        for path_val in [
+            rmpv::Value::Binary(b"a.webp".to_vec()),
+            rmpv::Value::Boolean(true),
+            rmpv::Value::Integer(1.into()),
+            rmpv::Value::Nil,
+        ] {
+            let map = vec![
+                (rmpv::Value::String("path".into()), path_val),
+                (rmpv::Value::String("key".into()), rmpv::Value::Nil),
+            ];
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(map)).unwrap();
+            assert!(
+                decode_media_request(&buf).is_err(),
+                "non-string path must be rejected"
+            );
+        }
     }
 }

@@ -552,6 +552,10 @@ fn serve_page(
 
     #[cfg(unix)]
     if shared.allow_executable_pages && is_unix_executable(&abs) {
+        // LinkManager request handlers must return RequestOutcome synchronously
+        // (no deferred-reply API). CGI therefore runs inline with a process-group
+        // timeout in `run_cgi`; moving this off-thread without dropping the reply
+        // requires rsReticulum support.
         let fields = decode_request_fields(data)
             .map(|f| f.fields)
             .unwrap_or_default();
