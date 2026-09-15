@@ -20,14 +20,18 @@
 ---
 
 rsNomad is a Rust implementation of Nomad Network **page, file, and media hosting**
-over Reticulum Links. This is not a fork of NomadNet; it is NomadNet page-server
+over Reticulum Links, plus shared **client request helpers** (path hashes, bodies,
+timeouts). This is not a fork of NomadNet; it is NomadNet interaction-layer
 behavior written in a different language, focused on staying interoperable with
-Python NomadNet **1.4.1** (PyPI) and MeshChat. It is not the source-of-truth
-implementation — do not treat it as one.
+Python NomadNet **1.4.3** hosting (`Node.py` pages/files/media including
+non-WebP→WebP conversion) and MeshChat / mesh-client browsers. It is not the
+source-of-truth implementation — do not treat it as one.
 
 Page hosting uses Reticulum Link request/response on aspect `nomadnetwork.node`.
 It is **not** LXMF messaging; use [rsLXMF](https://github.com/ratspeak/rsLXMF) for
-delivery and propagation.
+delivery and propagation. Browser UI, Micron rendering, and fetched-image LRU
+caches belong in clients (see mesh-client); this crate is the embeddable
+interaction layer.
 
 This repository currently lives under
 [Colorado-Mesh/rsNomad](https://github.com/Colorado-Mesh/rsNomad). Layout, license,
@@ -131,6 +135,9 @@ let node = NomadNode::spawn(
         announce_interval: Some(Duration::from_secs(3600)),
         announce_at_start: true,
         allow_executable_pages: false, // opt-in Unix CGI / executable .allowed
+        // media_cache: MediaCacheConfig::memory_only() by default
+        // For long-lived hosts: MediaCacheConfig::with_disk_root("/var/cache/nomad-media")
+        ..NomadNodeConfig::default()
     },
 )
 .await?;
@@ -138,13 +145,21 @@ let node = NomadNode::spawn(
 println!("serving at {}", node.destination_hash_hex());
 node.store().write_page_rel("about.mu", b"> About\n")?;
 node.reload_routes()?; // required after content CRUD so new routes are served
+// Embedders: wipe conversion cache from any user "Clear cache" control:
+node.clear_media_cache()?;
 ```
 
 `NomadNode` registers the `nomadnetwork.node` destination, installs a Link
 request handler for `/page/...`, `/file/...`, and `/media`, and announces with
 the display name as raw UTF-8 app data (canonical NomadNet format). Form bodies
 are decoded for CGI pages when `allow_executable_pages` is enabled; `/media`
-uses `decode_media_request` (`path` + `key`).
+uses `decode_media_request` (`path` + `key`). Non-WebP images under `pages/`
+are converted to WebP (NomadNet 1.4.3) and stored in an **in-memory** conversion
+cache by default.
+
+**Client helpers** (no Link I/O): `build_page_request` / `build_file_request` /
+`build_media_request`, `overall_timeout_secs`, `reply_file_name`, and related
+constants — so sidecar/embedders do not reimplement path hashes or codecs.
 
 This crate is not published to crates.io. For the full public API (CRUD helpers,
 stats, announce, error types, limits), generate local docs:
@@ -172,12 +187,21 @@ Mapping:
 
 - `pages/index.mu` → `/page/index.mu`
 - `pages/docs/help.mu` → `/page/docs/help.mu`
-- `pages/header.webp` → `/media` request with `path` = `header.webp` (WebP only)
+- `pages/header.webp` → `/media` request with `path` = `header.webp` (native WebP)
+- `pages/photo.png` → `/media` request with `path` = `photo.png` (converted to WebP)
 - `files/manual.pdf` → `/file/manual.pdf`
 
 Paths are resolved under each root without following symlink components; `..`,
 absolute escapes, NUL/backslash, and control characters are rejected. Default
 size caps are **512 KiB** for pages and **32 MiB** for files/media.
+
+**Media conversion cache:** NomadNet’s `converted_node` analogue. Default is
+**in-memory LRU** (256 entries / 192 MiB). Disk is opt-in only via
+`MediaCacheConfig::with_disk_root(path)` — the path must be **embedder-owned**,
+never under `pages/` or `files/`. Call `NomadNode::clear_media_cache()` (and
+optionally `clear_media_cache_key`) from any user-facing clear-cache control.
+Do **not** implement a parallel ImageCache in the mesh-client reticulum sidecar
+or write `<content_root>/cache/images/`.
 
 **Trust model:** content directories are trusted local storage. Operators must
 ensure they are not writable by untrusted local users. Symlink components are
@@ -213,11 +237,14 @@ CRUD.
   executable pages are enabled
 - Media: `encode_media_request` / `decode_media_request` for `{path, key}`
   maps (`key` may be Nil); route string exactly `/media`
+- Media types: `.webp` served native; `.png` / `.jpg` / `.jpeg` / `.bmp` /
+  `.gif` / `.tiff` converted to WebP (quality 85, max dimension 1200) with a
+  clearable conversion cache (NomadNet 1.4.3 `Node.serve_media` parity)
 - Large responses: use normal `Reply` bytes; `LinkManager` upgrades to a response
   Resource when the packed reply exceeds the Link MDU
 - File / media responses: `ReplyFile` — a response Resource with raw bytes and
   msgpack metadata `{"name": ...}` (relative path for `/file`, basename for
-  `/media`)
+  `/media`; converted media uses `*.webp` basename)
 - Announce app data: raw UTF-8 display name, capped at 256 bytes (also accepted
   by mesh-client discovery)
 - Hidden paths: dotfiles and `*.allowed` are not listed or served as content
@@ -232,7 +259,9 @@ CRUD.
 | --- | --- |
 | Static pages | Serve `.mu` (and other text) from `pages/` with 512 KiB default cap |
 | Static files | Serve binaries from `files/` with 32 MiB default cap as response Resources with filename metadata |
-| `/media` WebP | Exact `/media` route; pages-jail WebP only; basename `ReplyFile` metadata |
+| `/media` WebP | Exact `/media` route; native WebP + convert PNG/JPG/GIF/BMP/TIFF → WebP |
+| Media conversion cache | In-memory LRU by default; optional embedder disk root; `clear_media_cache` / `clear_media_cache_key` |
+| Client request helpers | `build_*_request`, timeout stages, `reply_file_name` (no Link I/O) |
 | `.allowed` ACL | Static identity-hash lists; optional sandboxed executable companions |
 | CGI pages | Opt-in (`allow_executable_pages`); Unix-only sandbox; default off |
 | Announce | Startup + periodic + transport reannounce with display name |
@@ -240,20 +269,26 @@ CRUD.
 | Default index | Placeholder Micron page when `index.mu` is missing |
 | Path safety | Traversal/symlink rejection, size limits, skip listing dotfiles/`*.allowed` |
 | Request budget | Bounded in-flight handlers + fixed-window admit limit |
+| Browser image/page LRU | mesh-client UI concern — not in this crate |
 | Markdown CMS | Application concern (e.g. mesh-client UI) — not in this crate |
 | Chat / forums | Roadmap only |
 | `nomad-serve-rs` CLI | Planned (optional tools crate) |
 
 ## Compatibility Notes
 
-Target clients: Python [NomadNet](https://github.com/markqvist/NomadNet) **1.4.1**
+Target clients: Python [NomadNet](https://github.com/markqvist/NomadNet) **1.4.3**
 and MeshChat browsers, plus [mesh-client](https://github.com/Colorado-Mesh/mesh-client)
 Nomad tab.
 
-Compatibility target for hosting behavior is the NomadNet **1.4.1 PyPI sdist**
-(`Node.py`: `serve_page`, `serve_file`, `serve_media`, `request_allowed`).
-CGI is **opt-in** and sandboxed (cleared env); Python inherits the parent
-environment — an intentional hardening difference.
+Compatibility target for hosting behavior is NomadNet **1.4.3**
+(`Node.py`: `serve_page`, `serve_file`, `serve_media` with conversion,
+`request_allowed`). CGI is **opt-in** and sandboxed (cleared env); Python
+inherits the parent environment — an intentional hardening difference.
+
+**Embedder contract (mesh-client reticulum sidecar):** call into `nomad-core`
+only. Do not own a sidecar `ImageCache` or create `<content_root>/cache/images/`.
+Wire any “Clear cache” UI to `NomadNode::clear_media_cache()`. Fetched remote
+image caching stays in the TypeScript renderer.
 
 This crate depends on Ratspeak [rsReticulum](https://github.com/ratspeak/rsReticulum)
 path dependencies during development. It is not compatible with unrelated RNS
@@ -267,10 +302,9 @@ Follow-ups (not required for basic hosting):
 2. Richer Micron helpers / builders
 3. Transfer repository ownership to the Ratspeak organization when permissions allow
 
-Application-layer CMS, chat rooms, forums, LXMF image/file attachments, and
-Micron rendering belong in clients such as mesh-client / rsLXMF, not in this
-protocol crate. In-page images use `/media` WebP under `pages/`; other binaries
-remain `/file/...` with Resource filename metadata.
+Application-layer CMS, chat rooms, forums, LXMF image/file attachments, Micron
+rendering, and **browser** image/page caches belong in clients such as
+mesh-client / rsLXMF, not in this protocol crate.
 
 ## Contributing
 

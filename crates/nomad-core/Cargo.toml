@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 bytes = { workspace = true }
 hex = { workspace = true }
+image = { workspace = true }
 rmpv = { workspace = true }
 rns-crypto = { workspace = true }
 rns-identity = { workspace = true }
