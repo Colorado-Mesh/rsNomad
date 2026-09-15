@@ -26,6 +26,11 @@ use crate::announce::{
 #[cfg(unix)]
 use crate::cgi::{is_unix_executable, run_cgi};
 use crate::error::NomadError;
+use crate::media_cache::{MediaCache, MediaCacheConfig};
+use crate::media_convert::{
+    DEFAULT_CONVERSION_MAX_DIMENSION, DEFAULT_CONVERSION_QUALITY, cache_key_for_source,
+    convert_bytes_to_webp, converted_basename, is_media_ext, is_native_media_ext, media_extension,
+};
 use crate::micron::{not_allowed_page, not_found_page};
 use crate::paths::{
     DEFAULT_INDEX_ROUTE, FILE_PREFIX, MEDIA_ROUTE, NOMAD_NODE_ASPECT, PAGE_PREFIX,
@@ -60,6 +65,13 @@ pub struct NomadNodeConfig {
     /// When true (Unix only), serve `+x` pages via sandboxed CGI and allow
     /// executable `.allowed` companions. Default off for security.
     pub allow_executable_pages: bool,
+    /// Host `/media` conversion cache (in-memory by default; disk only with
+    /// an embedder-owned [`MediaCacheConfig::disk_root`]).
+    pub media_cache: MediaCacheConfig,
+    /// WebP conversion quality (NomadNet default 85; used in cache keys).
+    pub media_conversion_quality: u8,
+    /// Max longest edge when converting (NomadNet default 1200).
+    pub media_conversion_max_dimension: u32,
 }
 
 impl Default for NomadNodeConfig {
@@ -69,6 +81,9 @@ impl Default for NomadNodeConfig {
             announce_interval: Some(Duration::from_secs(3600)),
             announce_at_start: true,
             allow_executable_pages: false,
+            media_cache: MediaCacheConfig::memory_only(),
+            media_conversion_quality: DEFAULT_CONVERSION_QUALITY,
+            media_conversion_max_dimension: DEFAULT_CONVERSION_MAX_DIMENSION,
         }
     }
 }
@@ -142,6 +157,9 @@ struct SharedState {
     stats: NomadServeStatsInner,
     budget: RequestBudget,
     allow_executable_pages: bool,
+    media_cache: Mutex<MediaCache>,
+    media_conversion_quality: u8,
+    media_conversion_max_dimension: u32,
 }
 
 struct RequestBudgetState {
@@ -272,6 +290,7 @@ impl NomadNode {
         let destination_hash = nomad_destination_hash(&identity);
         let event_rx = register_destination(&transport_tx, destination_hash, NOMAD_NODE_ASPECT);
 
+        let media_cache = MediaCache::new(config.media_cache.clone())?;
         let shared = Arc::new(SharedState {
             display_name: Mutex::new(display_name),
             store,
@@ -279,6 +298,9 @@ impl NomadNode {
             stats: NomadServeStatsInner::new(),
             budget: RequestBudget::new(),
             allow_executable_pages: config.allow_executable_pages,
+            media_cache: Mutex::new(media_cache),
+            media_conversion_quality: config.media_conversion_quality,
+            media_conversion_max_dimension: config.media_conversion_max_dimension,
         });
 
         // Pre-register known filesystem pages/files for path-hash lookup.
@@ -425,6 +447,36 @@ impl NomadNode {
             .write()
             .map_err(|_| NomadError::message("routes lock poisoned"))?;
         rebuild_routes(&mut routes, &self.shared.store)
+    }
+
+    /// Clear the host media conversion cache (memory and optional disk root).
+    ///
+    /// Embedders (e.g. mesh-client) must call this from any user-facing
+    /// “Clear cache” control when a conversion cache is active. In-memory-only
+    /// caches are wiped the same way.
+    pub fn clear_media_cache(&self) -> Result<(), NomadError> {
+        let mut cache = self
+            .shared
+            .media_cache
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("media_cache lock poisoned; recovering");
+                e.into_inner()
+            });
+        cache.clear()
+    }
+
+    /// Remove one conversion cache entry by key (`{sha}.q{q}.d{d}.webp`).
+    pub fn clear_media_cache_key(&self, key: &str) -> Result<(), NomadError> {
+        let mut cache = self
+            .shared
+            .media_cache
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("media_cache lock poisoned; recovering");
+                e.into_inner()
+            });
+        cache.clear_key(key)
     }
 
     /// Send one announce with the current display name.
@@ -667,11 +719,10 @@ fn serve_media(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    let ext_ok = std::path::Path::new(basename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("webp"));
-    if !ext_ok {
+    let Some(ext) = media_extension(basename) else {
+        return RequestOutcome::Drop;
+    };
+    if !is_media_ext(ext) {
         return RequestOutcome::Drop;
     }
 
@@ -689,25 +740,66 @@ fn serve_media(
         return RequestOutcome::Drop;
     }
 
-    match shared.store.read_media_rel(rel) {
-        Ok(bytes) => {
-            shared.stats.media_hits.fetch_add(1, Ordering::Relaxed);
-            let auto_compress = bytes.len() < FILE_AUTO_COMPRESS_MAX_BYTES;
-            RequestOutcome::ReplyFile {
-                data: bytes,
-                metadata: Some(pack_file_name_metadata(basename)),
-                auto_compress,
-            }
-        }
-        Err(NomadError::TooLarge { .. }) => RequestOutcome::Drop,
+    let source = match shared.store.read_media_rel(rel) {
+        Ok(bytes) => bytes,
+        Err(NomadError::TooLarge { .. }) => return RequestOutcome::Drop,
         Err(NomadError::NotFound(_)) => {
             shared.stats.not_found_count.fetch_add(1, Ordering::Relaxed);
-            RequestOutcome::Drop
+            return RequestOutcome::Drop;
         }
         Err(e) => {
             tracing::warn!(error = %e, path = %rel, "nomad media serve failed");
-            RequestOutcome::Drop
+            return RequestOutcome::Drop;
         }
+    };
+
+    let (reply_bytes, reply_name) = if is_native_media_ext(ext) {
+        (source, basename.to_string())
+    } else {
+        let quality = shared.media_conversion_quality;
+        let max_dim = shared.media_conversion_max_dimension;
+        let key = cache_key_for_source(&source, quality, max_dim);
+        let cached = {
+            let mut cache = shared.media_cache.lock().unwrap_or_else(|e| {
+                tracing::warn!("media_cache lock poisoned; recovering");
+                e.into_inner()
+            });
+            match cache.get(&key) {
+                Ok(hit) => hit,
+                Err(e) => {
+                    tracing::warn!(error = %e, "media cache get failed");
+                    None
+                }
+            }
+        };
+        let webp = if let Some(hit) = cached {
+            hit
+        } else {
+            let converted = match convert_bytes_to_webp(&source, quality, max_dim) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %rel, "media conversion failed");
+                    return RequestOutcome::Drop;
+                }
+            };
+            let mut cache = shared.media_cache.lock().unwrap_or_else(|e| {
+                tracing::warn!("media_cache lock poisoned; recovering");
+                e.into_inner()
+            });
+            if let Err(e) = cache.insert(key, converted.clone()) {
+                tracing::warn!(error = %e, "media cache insert failed");
+            }
+            converted
+        };
+        (webp, converted_basename(basename))
+    };
+
+    shared.stats.media_hits.fetch_add(1, Ordering::Relaxed);
+    let auto_compress = reply_bytes.len() < FILE_AUTO_COMPRESS_MAX_BYTES;
+    RequestOutcome::ReplyFile {
+        data: reply_bytes,
+        metadata: Some(pack_file_name_metadata(&reply_name)),
+        auto_compress,
     }
 }
 
@@ -747,6 +839,9 @@ mod tests {
             stats: NomadServeStatsInner::new(),
             budget: RequestBudget::new(),
             allow_executable_pages,
+            media_cache: Mutex::new(MediaCache::new(MediaCacheConfig::memory_only()).unwrap()),
+            media_conversion_quality: DEFAULT_CONVERSION_QUALITY,
+            media_conversion_max_dimension: DEFAULT_CONVERSION_MAX_DIMENSION,
         });
         {
             let mut routes = shared.routes.write().unwrap();
@@ -1067,13 +1162,66 @@ mod tests {
     }
 
     #[test]
-    fn media_rejects_non_webp() {
+    fn media_converts_png_and_caches() {
         let dir = TempDir::new().unwrap();
-        let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n"), ("a.png", b"PNG")], &[]);
-        let body = encode_media_request("a.png");
+        let png = {
+            use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+            use std::io::Cursor;
+            let img = RgbImage::from_pixel(2, 2, Rgb([0, 128, 255]));
+            let mut buf = Vec::new();
+            DynamicImage::ImageRgb8(img)
+                .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+        let shared =
+            shared_with_content(&dir, &[("index.mu", b"> ok\n"), ("pix.png", &png)], &[]);
+        let body = encode_media_request("pix.png");
+        let first = call(&shared, path_hash(MEDIA_ROUTE), body.clone(), None);
+        let webp_bytes = match first {
+            RequestOutcome::ReplyFile {
+                data, metadata, ..
+            } => {
+                let name = crate::client::reply_file_name(metadata.as_deref());
+                assert_eq!(name.as_deref(), Some("pix.webp"));
+                assert!(data.windows(4).any(|w| w == b"WEBP"));
+                data
+            }
+            other => panic!("expected converted ReplyFile, got {other:?}"),
+        };
+        assert_eq!(shared.stats.media_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            shared
+                .media_cache
+                .lock()
+                .unwrap()
+                .memory_len(),
+            1,
+            "conversion must populate media cache"
+        );
+        // Second hit should serve from cache (same bytes).
+        match call(&shared, path_hash(MEDIA_ROUTE), body, None) {
+            RequestOutcome::ReplyFile { data, .. } => assert_eq!(data, webp_bytes),
+            other => panic!("expected cached ReplyFile, got {other:?}"),
+        }
+        shared
+            .media_cache
+            .lock()
+            .unwrap()
+            .clear()
+            .unwrap();
+        assert_eq!(shared.media_cache.lock().unwrap().memory_len(), 0);
+    }
+
+    #[test]
+    fn media_rejects_unsupported_ext() {
+        let dir = TempDir::new().unwrap();
+        let shared =
+            shared_with_content(&dir, &[("index.mu", b"> ok\n"), ("a.txt", b"nope")], &[]);
+        let body = encode_media_request("a.txt");
         match call(&shared, path_hash(MEDIA_ROUTE), body, None) {
             RequestOutcome::Drop => {}
-            _ => panic!("expected Drop for non-webp"),
+            _ => panic!("expected Drop for unsupported media type"),
         }
     }
 

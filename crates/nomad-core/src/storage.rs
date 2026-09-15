@@ -157,7 +157,9 @@ impl NomadContentStore {
         read_rel(&self.roots.files_dir, self.roots.max_file_bytes, rel)
     }
 
-    /// Read a media asset from `pages/` using the file size cap (WebP `/media`).
+    /// Read a media asset from `pages/` using the file size cap (`/media`).
+    ///
+    /// Callers may convert non-WebP rasters; this method only reads bytes.
     pub fn read_media_rel(&self, rel: &str) -> Result<Vec<u8>, NomadError> {
         read_rel(&self.roots.pages_dir, self.roots.max_file_bytes, rel)
     }

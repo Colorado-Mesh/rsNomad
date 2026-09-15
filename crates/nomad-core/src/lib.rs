@@ -7,7 +7,10 @@
 mod acl;
 mod announce;
 mod cgi;
+mod client;
 mod error;
+mod media_cache;
+mod media_convert;
 mod micron;
 mod node;
 mod paths;
@@ -17,7 +20,23 @@ mod storage;
 pub use announce::{
     MAX_ANNOUNCE_NAME_BYTES, build_nomad_announce_packet, clamp_node_name, nomad_destination_hash,
 };
+pub use client::{
+    NOMAD_PATH_LOOKUP_SECS, NOMAD_RF_FIRST_HOP_SECS, NOMAD_RF_MAX_OVERALL_SECS,
+    NOMAD_RF_PER_HOP_TIMEOUT_SECS, NOMAD_RF_TRANSFER_GRACE_SECS, NOMAD_TCP_LINK_ESTABLISH_SECS,
+    NOMAD_TCP_TRANSFER_GRACE_SECS, NomadClientRequest, NomadEgress, build_file_request,
+    build_media_request, build_page_request, link_initiator_hops, overall_timeout,
+    overall_timeout_secs, reply_file_name,
+};
 pub use error::NomadError;
+pub use media_cache::{
+    DEFAULT_MEDIA_CACHE_MAX_BYTES, DEFAULT_MEDIA_CACHE_MAX_ENTRIES, MediaCache, MediaCacheConfig,
+    conversion_cache_key,
+};
+pub use media_convert::{
+    DEFAULT_CONVERSION_MAX_DIMENSION, DEFAULT_CONVERSION_QUALITY, MEDIA_EXTS, NATIVE_MEDIA_EXTS,
+    cache_key_for_source, convert_bytes_to_webp, converted_basename, is_media_ext,
+    is_native_media_ext, media_extension, source_content_sha256_hex,
+};
 pub use micron::{
     MAX_MICRON_TEXT_CHARS, default_index_page, not_allowed_page, not_found_page,
     sanitize_micron_text,

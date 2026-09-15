@@ -23,25 +23,30 @@ static hosting release used by mesh-client (#613).
 - Opt-in Unix CGI pages (`NomadNodeConfig.allow_executable_pages`, default off)
 - Micron `not_allowed_page()` matching Python `DEFAULT_NOTALLOWED`
 
+## Done (NomadNet 1.4.3 hosting + interaction helpers)
+
+- Host `/media` conversion for PNG/JPG/JPEG/BMP/GIF/TIFF → WebP (NomadNet
+  `Node.convert_media_to_webp` / `MEDIA_EXTS`)
+- Clearable conversion cache: in-memory LRU default; optional embedder
+  `MediaCacheConfig::disk_root`; `NomadNode::clear_media_cache` /
+  `clear_media_cache_key` (never under content `pages/` / `files/`)
+- Client Link request helpers: `build_page_request` / `build_file_request` /
+  `build_media_request`, timeout stages, `reply_file_name`
+
 ## Near-term
 
 - **Clients import existing `nomad-core` constants** (mesh-client sidecar still
-  hardcodes `NOMAD_NODE_ASPECT` and page/file size caps that this crate already
-  exports). No rsNomad change required — switch the sidecar to
-  `NOMAD_NODE_ASPECT`, `DEFAULT_MAX_PAGE_BYTES`, and `DEFAULT_MAX_FILE_BYTES`.
-- Optional `nomad-client` crate for shared fetch timeouts / Link query
-  skeleton — add when a **second Rust consumer** appears (e.g. `nomad-tools`)
-  or timeout constants drift and cause bugs. Until then keep timeout math in
-  the sidecar; mesh-client product policy such as `force_path_refresh` stays in
-  clients. TS UI/proxy mirrors remain client-side.
+  hardcodes some timeout helpers that this crate now exports — prefer
+  `overall_timeout_secs` / `link_initiator_hops` over local duplicates).
 - Optional `nomad-tools` crate with `nomad-serve-rs` headless binary
-- Stronger interop fixtures against Python NomadNet page fetches
+- Stronger interop fixtures against Python NomadNet page/media fetches
 - Async / `spawn_blocking` serve path if LinkManager gains an async handler API
 
 ## Later (application / mesh-client)
 
 These belong in clients such as mesh-client, not in the protocol crate:
 
+- Browser fetched-image LRU / clear-cache UI (`browser/` analogue)
 - Markdown → Micron page composer / CMS workflow
 - Theme and navigation editors
 - NomadNet-style chat room apps
@@ -54,8 +59,10 @@ These belong in clients such as mesh-client, not in the protocol crate:
 - Unsandboxed CGI with full parent-env inheritance (Python footgun; we clear env)
 - Embedding hosting inside `rsLXMF`
 - Depending on non-Ratspeak RNS stacks (`nomadnet-rs` / `rns-net`)
-- Server-side MIME/`/image/` routes (in-page images use `/media` WebP; other
+- Server-side MIME/`/image/` routes (in-page images use `/media`; other
   binaries remain ordinary `/file/...`)
+- Sidecar-owned ImageCache or `<content_root>/cache/images/` trees
+- TUI `converted_disp` terminal glyph cache
 
 ## Ownership
 
