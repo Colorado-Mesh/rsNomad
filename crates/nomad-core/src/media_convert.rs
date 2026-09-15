@@ -22,9 +22,7 @@ pub const NATIVE_MEDIA_EXTS: &[&str] = &["webp"];
 
 /// True when `ext` (no leading dot) is a supported `/media` type.
 pub fn is_media_ext(ext: &str) -> bool {
-    MEDIA_EXTS
-        .iter()
-        .any(|e| e.eq_ignore_ascii_case(ext))
+    MEDIA_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext))
 }
 
 /// True when `ext` is native WebP (no conversion).
@@ -36,9 +34,7 @@ pub fn is_native_media_ext(ext: &str) -> bool {
 
 /// Extension of a path's final component (lowercased, no dot), if any.
 pub fn media_extension(path: &str) -> Option<&str> {
-    Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
+    Path::new(path).extension().and_then(|e| e.to_str())
 }
 
 /// SHA-256 hex of source bytes (NomadNet conversion cache key input).

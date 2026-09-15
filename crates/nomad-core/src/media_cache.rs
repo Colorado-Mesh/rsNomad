@@ -217,7 +217,7 @@ impl MediaCache {
             total = total.saturating_add(len);
             entries.push((mtime, len, path));
         }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_by_key(|a| a.0);
         while entries.len() > self.config.max_entries || total > self.config.max_bytes {
             let Some((_, size, path)) = entries.first().cloned() else {
                 break;
@@ -314,8 +314,14 @@ mod tests {
         cache.insert("c.webp".into(), b"3".to_vec()).unwrap();
         assert_eq!(cache.memory_len(), 2);
         assert!(cache.get("a.webp").unwrap().is_none());
-        assert_eq!(cache.get("b.webp").unwrap().as_deref(), Some(b"2".as_slice()));
-        assert_eq!(cache.get("c.webp").unwrap().as_deref(), Some(b"3".as_slice()));
+        assert_eq!(
+            cache.get("b.webp").unwrap().as_deref(),
+            Some(b"2".as_slice())
+        );
+        assert_eq!(
+            cache.get("c.webp").unwrap().as_deref(),
+            Some(b"3".as_slice())
+        );
     }
 
     #[test]

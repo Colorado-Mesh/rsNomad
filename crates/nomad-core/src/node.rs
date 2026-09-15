@@ -455,27 +455,19 @@ impl NomadNode {
     /// “Clear cache” control when a conversion cache is active. In-memory-only
     /// caches are wiped the same way.
     pub fn clear_media_cache(&self) -> Result<(), NomadError> {
-        let mut cache = self
-            .shared
-            .media_cache
-            .lock()
-            .unwrap_or_else(|e| {
-                tracing::warn!("media_cache lock poisoned; recovering");
-                e.into_inner()
-            });
+        let mut cache = self.shared.media_cache.lock().unwrap_or_else(|e| {
+            tracing::warn!("media_cache lock poisoned; recovering");
+            e.into_inner()
+        });
         cache.clear()
     }
 
     /// Remove one conversion cache entry by key (`{sha}.q{q}.d{d}.webp`).
     pub fn clear_media_cache_key(&self, key: &str) -> Result<(), NomadError> {
-        let mut cache = self
-            .shared
-            .media_cache
-            .lock()
-            .unwrap_or_else(|e| {
-                tracing::warn!("media_cache lock poisoned; recovering");
-                e.into_inner()
-            });
+        let mut cache = self.shared.media_cache.lock().unwrap_or_else(|e| {
+            tracing::warn!("media_cache lock poisoned; recovering");
+            e.into_inner()
+        });
         cache.clear_key(key)
     }
 
@@ -1174,14 +1166,11 @@ mod tests {
                 .unwrap();
             buf
         };
-        let shared =
-            shared_with_content(&dir, &[("index.mu", b"> ok\n"), ("pix.png", &png)], &[]);
+        let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n"), ("pix.png", &png)], &[]);
         let body = encode_media_request("pix.png");
         let first = call(&shared, path_hash(MEDIA_ROUTE), body.clone(), None);
         let webp_bytes = match first {
-            RequestOutcome::ReplyFile {
-                data, metadata, ..
-            } => {
+            RequestOutcome::ReplyFile { data, metadata, .. } => {
                 let name = crate::client::reply_file_name(metadata.as_deref());
                 assert_eq!(name.as_deref(), Some("pix.webp"));
                 assert!(data.windows(4).any(|w| w == b"WEBP"));
@@ -1191,11 +1180,7 @@ mod tests {
         };
         assert_eq!(shared.stats.media_hits.load(Ordering::Relaxed), 1);
         assert_eq!(
-            shared
-                .media_cache
-                .lock()
-                .unwrap()
-                .memory_len(),
+            shared.media_cache.lock().unwrap().memory_len(),
             1,
             "conversion must populate media cache"
         );
@@ -1204,20 +1189,14 @@ mod tests {
             RequestOutcome::ReplyFile { data, .. } => assert_eq!(data, webp_bytes),
             other => panic!("expected cached ReplyFile, got {other:?}"),
         }
-        shared
-            .media_cache
-            .lock()
-            .unwrap()
-            .clear()
-            .unwrap();
+        shared.media_cache.lock().unwrap().clear().unwrap();
         assert_eq!(shared.media_cache.lock().unwrap().memory_len(), 0);
     }
 
     #[test]
     fn media_rejects_unsupported_ext() {
         let dir = TempDir::new().unwrap();
-        let shared =
-            shared_with_content(&dir, &[("index.mu", b"> ok\n"), ("a.txt", b"nope")], &[]);
+        let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n"), ("a.txt", b"nope")], &[]);
         let body = encode_media_request("a.txt");
         match call(&shared, path_hash(MEDIA_ROUTE), body, None) {
             RequestOutcome::Drop => {}
