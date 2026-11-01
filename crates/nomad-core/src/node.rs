@@ -24,7 +24,7 @@ use crate::announce::{
     clamp_node_name, nomad_destination_hash, send_nomad_announce, send_nomad_announce_try,
 };
 #[cfg(unix)]
-use crate::cgi::{is_unix_executable, run_cgi};
+use crate::cgi::{CgiOptions, is_unix_executable, run_cgi};
 use crate::error::NomadError;
 use crate::media_cache::{MediaCache, MediaCacheConfig};
 use crate::media_convert::{
@@ -65,6 +65,13 @@ pub struct NomadNodeConfig {
     /// When true (Unix only), serve `+x` pages via sandboxed CGI and allow
     /// executable `.allowed` companions. Default off for security.
     pub allow_executable_pages: bool,
+    /// The `PATH` executable pages are started with. `None` keeps the
+    /// sandboxed `/usr/bin:/bin`; NomadNet passes the host's own.
+    pub script_path: Option<String>,
+    /// How long an executable page may run. NomadNet waits without limit;
+    /// the default here is 10 seconds. A page runs inside the request
+    /// handler, so a long limit holds up other requests while it runs.
+    pub script_timeout: Duration,
     /// Host `/media` conversion cache (in-memory by default; disk only with
     /// an embedder-owned [`MediaCacheConfig::disk_root`]).
     pub media_cache: MediaCacheConfig,
@@ -81,6 +88,8 @@ impl Default for NomadNodeConfig {
             announce_interval: Some(Duration::from_secs(3600)),
             announce_at_start: true,
             allow_executable_pages: false,
+            script_path: None,
+            script_timeout: crate::cgi::CGI_TIMEOUT,
             media_cache: MediaCacheConfig::memory_only(),
             media_conversion_quality: DEFAULT_CONVERSION_QUALITY,
             media_conversion_max_dimension: DEFAULT_CONVERSION_MAX_DIMENSION,
@@ -157,6 +166,7 @@ struct SharedState {
     stats: NomadServeStatsInner,
     budget: RequestBudget,
     allow_executable_pages: bool,
+    cgi: CgiOptions,
     media_cache: Mutex<MediaCache>,
     media_conversion_quality: u8,
     media_conversion_max_dimension: u32,
@@ -298,6 +308,13 @@ impl NomadNode {
             stats: NomadServeStatsInner::new(),
             budget: RequestBudget::new(),
             allow_executable_pages: config.allow_executable_pages,
+            cgi: CgiOptions {
+                path: config
+                    .script_path
+                    .clone()
+                    .unwrap_or_else(|| crate::cgi::SANITIZED_PATH.into()),
+                timeout: config.script_timeout,
+            },
             media_cache: Mutex::new(media_cache),
             media_conversion_quality: config.media_conversion_quality,
             media_conversion_max_dimension: config.media_conversion_max_dimension,
@@ -604,7 +621,7 @@ fn serve_page(
             .map(|f| f.fields)
             .unwrap_or_default();
         let max = shared.store.roots().max_page_bytes;
-        match run_cgi(&abs, link_id, remote_identity, &fields, max) {
+        match run_cgi(&abs, link_id, remote_identity, &fields, max, &shared.cgi) {
             Ok(bytes) => {
                 shared.stats.page_hits.fetch_add(1, Ordering::Relaxed);
                 return RequestOutcome::Reply(bytes);
@@ -618,6 +635,13 @@ fn serve_page(
     #[cfg(not(unix))]
     {
         let _ = (link_id, data);
+    }
+
+    // With scripts off, an executable page is a program, not content: its
+    // text (which may hold secrets) must not go out as if it were a page.
+    if !shared.allow_executable_pages && is_unix_executable(&abs) {
+        shared.stats.not_found_count.fetch_add(1, Ordering::Relaxed);
+        return RequestOutcome::Reply(not_found_page(route).into_bytes());
     }
 
     match shared.store.read_page_route(route) {
@@ -831,6 +855,7 @@ mod tests {
             stats: NomadServeStatsInner::new(),
             budget: RequestBudget::new(),
             allow_executable_pages,
+            cgi: CgiOptions::default(),
             media_cache: Mutex::new(MediaCache::new(MediaCacheConfig::memory_only()).unwrap()),
             media_conversion_quality: DEFAULT_CONVERSION_QUALITY,
             media_conversion_max_dimension: DEFAULT_CONVERSION_MAX_DIMENSION,
@@ -1285,7 +1310,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn cgi_off_serves_executable_page_as_static() {
+    fn cgi_off_does_not_send_an_executable_pages_text() {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
         let shared = shared_with_content(&dir, &[("index.mu", b"> ok\n")], &[]);
@@ -1300,9 +1325,11 @@ mod tests {
         }
         match call(&shared, path_hash("/page/dyn.mu"), Vec::new(), None) {
             RequestOutcome::Reply(bytes) => {
-                assert_eq!(bytes, b"#!/bin/sh\necho SHOULD_NOT_RUN\n");
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(!text.contains("SHOULD_NOT_RUN"), "{text}");
+                assert_eq!(bytes, not_found_page("/page/dyn.mu").into_bytes());
             }
-            _ => panic!("CGI off must read static bytes"),
+            _ => panic!("CGI off must answer, not leak or run the script"),
         }
     }
 
