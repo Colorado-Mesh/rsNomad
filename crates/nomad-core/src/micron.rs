@@ -48,6 +48,18 @@ pub fn not_found_page(route: &str) -> String {
     )
 }
 
+/// Micron body for an executable page that failed (timed out, too much
+/// output, or could not run), so the visitor isn't left waiting.
+pub fn script_failed_page(route: &str) -> String {
+    let route = sanitize_micron_text(route);
+    format!(
+        "#!c=0\n\
+         > Page failed\n\
+         \n\
+         The page `{route}` could not be generated on this node.\n"
+    )
+}
+
 /// Micron body matching Python NomadNet `DEFAULT_NOTALLOWED` (ACL deny).
 pub fn not_allowed_page() -> &'static str {
     ">Request Not Allowed\n\
