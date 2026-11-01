@@ -24,7 +24,8 @@ use crate::announce::{
     clamp_node_name, nomad_destination_hash, send_nomad_announce, send_nomad_announce_try,
 };
 #[cfg(unix)]
-use crate::cgi::{CgiOptions, is_unix_executable, run_cgi};
+use crate::cgi::run_cgi;
+use crate::cgi::{CgiOptions, is_unix_executable};
 use crate::error::NomadError;
 use crate::media_cache::{MediaCache, MediaCacheConfig};
 use crate::media_convert::{
@@ -175,6 +176,8 @@ struct SharedState {
     stats: NomadServeStatsInner,
     budget: RequestBudget,
     allow_executable_pages: bool,
+    /// Only read where scripts can run (Unix).
+    #[cfg_attr(not(unix), allow(dead_code))]
     cgi: CgiOptions,
     media_cache: Mutex<MediaCache>,
     media_conversion_quality: u8,
