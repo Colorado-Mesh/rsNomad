@@ -32,7 +32,7 @@ use crate::media_convert::{
     DEFAULT_CONVERSION_MAX_DIMENSION, DEFAULT_CONVERSION_QUALITY, cache_key_for_source,
     convert_bytes_to_webp, converted_basename, is_media_ext, is_native_media_ext, media_extension,
 };
-use crate::micron::{not_allowed_page, not_found_page};
+use crate::micron::{not_allowed_page, not_found_page, script_failed_page};
 use crate::paths::{
     DEFAULT_INDEX_ROUTE, FILE_PREFIX, MEDIA_ROUTE, NOMAD_NODE_ASPECT, PAGE_PREFIX,
     normalize_file_route, normalize_page_route, path_hash, resolve_under_root, strip_file_prefix,
@@ -656,7 +656,7 @@ fn serve_page(
             }
             Err(e) => {
                 tracing::warn!(error = %e, route = %route, "nomad CGI page failed");
-                return RequestOutcome::Drop;
+                return RequestOutcome::Reply(script_failed_page(route).into_bytes());
             }
         }
     }
@@ -1393,6 +1393,38 @@ mod tests {
                 assert_eq!(bytes, b"> cgi-ok\n");
             }
             other => panic!("expected CGI stdout reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cgi_failure_replies_with_an_error_page() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let shared = shared_with_content_opts(&dir, &[("index.mu", b"> ok\n")], &[], true);
+        let script = dir.path().join("pages/huge.mu");
+        let max = shared.store.roots().max_page_bytes;
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nhead -c {} /dev/zero\n", max + 1),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        {
+            let mut routes = shared.routes.write().unwrap();
+            rebuild_routes(&mut routes, &shared.store).unwrap();
+        }
+        match call(&shared, path_hash("/page/huge.mu"), Vec::new(), None) {
+            RequestOutcome::Reply(bytes) => {
+                let body = String::from_utf8_lossy(&bytes);
+                assert!(
+                    body.contains("Page failed") && body.contains("/page/huge.mu"),
+                    "{body}"
+                );
+            }
+            other => panic!("expected an error page, got {other:?}"),
         }
     }
 
