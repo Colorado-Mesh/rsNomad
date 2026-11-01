@@ -5,7 +5,7 @@
 //! (with size caps). Callers that need non-blocking I/O should keep content
 //! small or host behind a process that isolates disk stalls.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -112,7 +112,16 @@ pub struct NomadServeStats {
     pub not_found_count: u64,
     /// Wall-clock ms of the last admitted request, if any.
     pub last_request_ms: Option<u64>,
+    /// Different identities that identified themselves to this node since it
+    /// started (a visitor who doesn't identify can't be told apart). Stops
+    /// growing at [`MAX_TRACKED_VISITORS`].
+    #[serde(default)]
+    pub visitors: u64,
 }
+
+/// The most identities remembered to count visitors, so a flood of new
+/// identities can't grow the node's memory without end.
+pub const MAX_TRACKED_VISITORS: usize = 10_000;
 
 struct RouteTable {
     /// path_hash → absolute route string (`/page/...` or `/file/...`)
@@ -237,6 +246,7 @@ struct NomadServeStatsInner {
     media_hits: AtomicU64,
     not_found_count: AtomicU64,
     last_request_ms: AtomicU64,
+    visitors: Mutex<HashSet<[u8; 16]>>,
 }
 
 impl NomadServeStatsInner {
@@ -248,6 +258,7 @@ impl NomadServeStatsInner {
             media_hits: AtomicU64::new(0),
             not_found_count: AtomicU64::new(0),
             last_request_ms: AtomicU64::new(0),
+            visitors: Mutex::new(HashSet::new()),
         }
     }
 
@@ -260,6 +271,16 @@ impl NomadServeStatsInner {
             media_hits: self.media_hits.load(Ordering::Relaxed),
             not_found_count: self.not_found_count.load(Ordering::Relaxed),
             last_request_ms: if last == 0 { None } else { Some(last) },
+            visitors: self.visitors.lock().map_or(0, |set| set.len() as u64),
+        }
+    }
+
+    /// Remember a visitor who identified (up to the cap).
+    fn note_visitor(&self, identity: &Identity) {
+        if let Ok(mut set) = self.visitors.lock()
+            && set.len() < MAX_TRACKED_VISITORS
+        {
+            set.insert(identity.hash);
         }
     }
 }
@@ -556,6 +577,9 @@ fn handle_request(
         .stats
         .last_request_ms
         .store(now_ms, Ordering::Relaxed);
+    if let Some(identity) = remote_identity.as_ref() {
+        shared.stats.note_visitor(identity);
+    }
 
     let route = lookup_route(shared, path_hash_bytes);
 
@@ -921,6 +945,15 @@ mod tests {
         assert_eq!(stats.page_hits, 1);
         assert_eq!(stats.file_hits, 1);
         assert_eq!(stats.request_count, 2);
+        assert_eq!(stats.visitors, 0, "nobody identified");
+
+        // Visitors who identify are counted once each.
+        let (amy, ben) = (identity_with_hash([1; 16]), identity_with_hash([2; 16]));
+        for visitor in [&amy, &ben, &amy, &amy] {
+            call(&shared, page_hash, Vec::new(), Some(visitor.clone()));
+        }
+        call(&shared, page_hash, Vec::new(), None);
+        assert_eq!(shared.stats.snapshot().visitors, 2);
     }
 
     #[test]
