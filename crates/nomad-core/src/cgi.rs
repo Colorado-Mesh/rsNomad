@@ -14,7 +14,29 @@ use crate::error::NomadError;
 pub const CGI_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Minimal PATH for sandboxed scripts (never inherit the full parent env).
-const SANITIZED_PATH: &str = "/usr/bin:/bin";
+pub const SANITIZED_PATH: &str = "/usr/bin:/bin";
+
+/// How scripts run: the `PATH` they see and how long they may take.
+///
+/// The default is the sandboxed `PATH` and [`CGI_TIMEOUT`]. NomadNet gives a
+/// script the host's own `PATH` and waits for it, so a node that wants that
+/// (for `#!/usr/bin/env python3` from Homebrew, pyenv or a venv) sets both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CgiOptions {
+    /// The `PATH` a script is started with.
+    pub path: String,
+    /// How long a script may run before it and its children are killed.
+    pub timeout: Duration,
+}
+
+impl Default for CgiOptions {
+    fn default() -> Self {
+        Self {
+            path: SANITIZED_PATH.into(),
+            timeout: CGI_TIMEOUT,
+        }
+    }
+}
 
 /// True when `path` exists and is executable by the current user (Unix `X_OK`).
 #[cfg(unix)]
@@ -35,7 +57,7 @@ pub fn is_unix_executable(_path: &Path) -> bool {
 ///
 /// Sets only `PATH` (sanitized), optional `link_id` / `remote_identity` hex, and
 /// `field_*` / `var_*` entries from `fields`. Captures stdout (capped), discards
-/// stderr, uses no shell, and enforces [`CGI_TIMEOUT`].
+/// stderr, uses no shell, and enforces `options.timeout`.
 ///
 /// The child is placed in its own process group so timeouts / completion can
 /// signal the whole tree (descendants cannot hold the stdout pipe open).
@@ -46,8 +68,16 @@ pub fn run_cgi(
     remote_identity: Option<&Identity>,
     fields: &BTreeMap<String, String>,
     max_stdout: usize,
+    options: &CgiOptions,
 ) -> Result<Vec<u8>, NomadError> {
-    run_sandboxed(script, link_id, remote_identity, fields, max_stdout)
+    run_sandboxed(
+        script,
+        link_id,
+        remote_identity,
+        fields,
+        max_stdout,
+        options,
+    )
 }
 
 #[cfg(not(unix))]
@@ -57,6 +87,7 @@ pub fn run_cgi(
     _remote_identity: Option<&Identity>,
     _fields: &BTreeMap<String, String>,
     _max_stdout: usize,
+    _options: &CgiOptions,
 ) -> Result<Vec<u8>, NomadError> {
     Err(NomadError::message("CGI is not supported on this platform"))
 }
@@ -65,7 +96,14 @@ pub fn run_cgi(
 #[cfg(unix)]
 pub fn run_allowlist_script(script: &Path) -> Result<Vec<u8>, NomadError> {
     // Allowlists do not receive link/form context — empty fields, zero link id.
-    run_sandboxed(script, [0u8; 16], None, &BTreeMap::new(), 64 * 1024)
+    run_sandboxed(
+        script,
+        [0u8; 16],
+        None,
+        &BTreeMap::new(),
+        64 * 1024,
+        &CgiOptions::default(),
+    )
 }
 
 #[cfg(not(unix))]
@@ -82,6 +120,7 @@ fn run_sandboxed(
     remote_identity: Option<&Identity>,
     fields: &BTreeMap<String, String>,
     max_stdout: usize,
+    options: &CgiOptions,
 ) -> Result<Vec<u8>, NomadError> {
     use std::os::unix::process::CommandExt;
 
@@ -94,7 +133,7 @@ fn run_sandboxed(
 
     let mut command = Command::new(script);
     command.env_clear();
-    command.env("PATH", SANITIZED_PATH);
+    command.env("PATH", &options.path);
     command.env("link_id", hex::encode(link_id));
     if let Some(id) = remote_identity {
         command.env("remote_identity", hex::encode(id.hash));
@@ -123,7 +162,7 @@ fn run_sandboxed(
         limited.read_to_end(&mut buf).map(|_| buf)
     });
 
-    let status = match wait_with_timeout(&mut child, CGI_TIMEOUT) {
+    let status = match wait_with_timeout(&mut child, options.timeout) {
         Ok(status) => {
             // Child already reaped by try_wait; kill any descendants still holding pipes.
             terminate_process_group(child_pid);
@@ -215,7 +254,15 @@ mod tests {
         fields.insert("other".into(), "nope".into());
         let id = Identity::new();
         let link = [0x11u8; 16];
-        let out = run_cgi(&script, link, Some(&id), &fields, 1024).unwrap();
+        let out = run_cgi(
+            &script,
+            link,
+            Some(&id),
+            &fields,
+            1024,
+            &CgiOptions::default(),
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with("hi-"));
         assert!(text.contains(&hex::encode(id.hash)));
@@ -237,7 +284,15 @@ mod tests {
         let mut perms = std::fs::metadata(&script).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
-        let err = run_cgi(&script, [0u8; 16], None, &BTreeMap::new(), 8).unwrap_err();
+        let err = run_cgi(
+            &script,
+            [0u8; 16],
+            None,
+            &BTreeMap::new(),
+            8,
+            &CgiOptions::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, NomadError::TooLarge { .. }));
     }
 
@@ -247,15 +302,68 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
         let script = dir.path().join("hang.mu");
-        // Child sleeps past CGI_TIMEOUT; process group kill must reclaim it.
+        // Child sleeps past the timeout; process group kill must reclaim it.
         std::fs::write(&script, b"#!/bin/sh\nsleep 60\n").unwrap();
         let mut perms = std::fs::metadata(&script).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
-        let err = run_cgi(&script, [0u8; 16], None, &BTreeMap::new(), 1024).unwrap_err();
+        let options = CgiOptions {
+            timeout: Duration::from_millis(300),
+            ..CgiOptions::default()
+        };
+        let err = run_cgi(&script, [0u8; 16], None, &BTreeMap::new(), 1024, &options).unwrap_err();
         assert!(
             err.to_string().contains("timed out"),
             "expected timeout, got {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cgi_uses_the_configured_path_and_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("env.mu");
+        std::fs::write(&script, b"#!/bin/sh\nprintf '%s' \"$PATH\"\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        let fields = BTreeMap::new();
+        let out = run_cgi(
+            &script,
+            [0; 16],
+            None,
+            &fields,
+            1024,
+            &CgiOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(out, SANITIZED_PATH.as_bytes());
+        let options = CgiOptions {
+            path: "/usr/bin:/bin:/opt/py/bin".into(),
+            ..CgiOptions::default()
+        };
+        let out = run_cgi(&script, [0; 16], None, &fields, 1024, &options).unwrap();
+        assert_eq!(out, b"/usr/bin:/bin:/opt/py/bin");
+
+        // A script slower than the default 10 s limit finishes with a longer one.
+        let slow = dir.path().join("slow.mu");
+        std::fs::write(&slow, b"#!/bin/sh\nsleep 1\nprintf done\n").unwrap();
+        let mut perms = std::fs::metadata(&slow).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&slow, perms).unwrap();
+        let short = CgiOptions {
+            timeout: Duration::from_millis(200),
+            ..CgiOptions::default()
+        };
+        assert!(run_cgi(&slow, [0; 16], None, &fields, 1024, &short).is_err());
+        let long = CgiOptions {
+            timeout: Duration::from_secs(5),
+            ..CgiOptions::default()
+        };
+        assert_eq!(
+            run_cgi(&slow, [0; 16], None, &fields, 1024, &long).unwrap(),
+            b"done"
         );
     }
 
