@@ -280,10 +280,11 @@ impl NomadServeStatsInner {
 
     /// Remember a visitor who identified (up to the cap).
     fn note_visitor(&self, identity: &Identity) {
-        if let Ok(mut set) = self.visitors.lock()
-            && set.len() < MAX_TRACKED_VISITORS
-        {
-            set.insert(identity.hash);
+        // Nested rather than a let chain, which needs Rust 1.88.
+        if let Ok(mut set) = self.visitors.lock() {
+            if set.len() < MAX_TRACKED_VISITORS {
+                set.insert(identity.hash);
+            }
         }
     }
 }
