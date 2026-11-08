@@ -65,6 +65,7 @@ pub fn request_allowed(
     }
 }
 
+/// Reads a `.allowed` file, running it when it is an executable and scripts are on, and refusing symlinks.
 fn read_allowed_bytes(allowed_path: &Path, allow_executable: bool) -> std::io::Result<Vec<u8>> {
     if let Err(e) = reject_if_symlink(allowed_path) {
         return Err(std::io::Error::other(e.to_string()));
@@ -107,6 +108,7 @@ pub fn parse_allowed_hashes(input: &[u8]) -> Vec<[u8; 16]> {
     out
 }
 
+/// Trims leading and trailing ASCII whitespace from a byte slice.
 fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
@@ -126,6 +128,7 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
+    /// Test helper: an identity with a chosen hash.
     fn identity_with_hash(hash: [u8; 16]) -> Identity {
         let mut id = Identity::new();
         // Tests only: override truncated hash used by ACL matching.
@@ -133,6 +136,7 @@ mod tests {
         id
     }
 
+    /// A page with no companion `.allowed` file is open to everyone.
     #[test]
     fn missing_companion_allows() {
         let dir = tempdir().unwrap();
@@ -141,6 +145,7 @@ mod tests {
         assert_eq!(request_allowed(&resource, None, false), AclDecision::Allow);
     }
 
+    /// A path that ends in `.allowed` is never served.
     #[test]
     fn path_ending_allowed_denies() {
         let dir = tempdir().unwrap();
@@ -149,6 +154,7 @@ mod tests {
         assert_eq!(request_allowed(&resource, None, false), AclDecision::Deny);
     }
 
+    /// A static allow list admits only the identities it names.
     #[test]
     fn static_list_requires_listed_identity() {
         let dir = tempdir().unwrap();
@@ -173,6 +179,7 @@ mod tests {
         );
     }
 
+    /// Parsing an allow list trims whitespace and drops lines that are not hashes.
     #[test]
     fn parse_allowed_hashes_trims_and_filters() {
         let input = b"  aabbccddeeff00112233445566778899  \n\
@@ -189,6 +196,7 @@ mod tests {
         assert_eq!(hashes[1], expected);
     }
 
+    /// With scripts off, an executable `.allowed` is read as plain text.
     #[test]
     #[cfg(unix)]
     fn executable_allowed_reads_as_static_when_cgi_off() {

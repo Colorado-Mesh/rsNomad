@@ -180,6 +180,7 @@ impl NomadContentStore {
     }
 }
 
+/// Lists the regular files under a root, sorted by path.
 fn list_under(root: &Path) -> Result<Vec<NomadPageEntry>, NomadError> {
     let mut out = Vec::new();
     collect_files(root, root, &mut out, 0)?;
@@ -187,12 +188,14 @@ fn list_under(root: &Path) -> Result<Vec<NomadPageEntry>, NomadError> {
     Ok(out)
 }
 
+/// Reads a file under a root, refusing symlinks and anything over `max` bytes.
 fn read_rel(root: &Path, max: usize, rel: &str) -> Result<Vec<u8>, NomadError> {
     let path = resolve_under_root(root, rel)?;
     ensure_regular_file(&path, rel)?;
     read_limited(&path, max)
 }
 
+/// Writes a file under a root, refusing symlinks and content over `max` bytes.
 fn write_rel(root: &Path, max: usize, rel: &str, content: &[u8]) -> Result<(), NomadError> {
     validate_content_relative_path(rel)?;
     if content.len() > max {
@@ -209,6 +212,7 @@ fn write_rel(root: &Path, max: usize, rel: &str, content: &[u8]) -> Result<(), N
     Ok(())
 }
 
+/// Deletes a file under a root; a missing file is not found.
 fn delete_rel(root: &Path, rel: &str) -> Result<(), NomadError> {
     let path = resolve_under_root(root, rel)?;
     ensure_regular_file(&path, rel)?;
@@ -239,6 +243,7 @@ fn read_limited(path: &Path, max: usize) -> Result<Vec<u8>, NomadError> {
     Ok(buf)
 }
 
+/// Checks that a path is a regular file and not a symlink.
 fn ensure_regular_file(path: &Path, rel: &str) -> Result<(), NomadError> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -254,6 +259,7 @@ fn ensure_regular_file(path: &Path, rel: &str) -> Result<(), NomadError> {
     Ok(())
 }
 
+/// Writes a file through a temporary file in the same directory, so a reader never sees half of it.
 fn atomic_write(path: &Path, content: &[u8]) -> Result<(), NomadError> {
     let parent = path
         .parent()
@@ -289,6 +295,7 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), NomadError> {
     })))
 }
 
+/// Walks a directory, skipping symlinks, dotfiles and `.allowed` files, and stops at the depth limit.
 fn collect_files(
     root: &Path,
     dir: &Path,
@@ -358,12 +365,14 @@ mod tests {
     use super::*;
     use tempfile::{TempDir, tempdir};
 
+    /// Test helper: a content store in a new temporary directory.
     fn test_store() -> (TempDir, NomadContentStore) {
         let dir = tempdir().unwrap();
         let store = NomadContentStore::new(NomadContentRoots::under(dir.path())).unwrap();
         (dir, store)
     }
 
+    /// A page can be written, read, listed and deleted.
     #[test]
     fn page_crud_roundtrip() {
         let (_dir, store) = test_store();
@@ -376,6 +385,7 @@ mod tests {
         assert!(store.read_page_rel("index.mu").is_err());
     }
 
+    /// A file can be written, read and deleted, and deleting a missing one fails.
     #[test]
     fn file_crud_and_delete_missing() {
         let (_dir, store) = test_store();
@@ -388,6 +398,7 @@ mod tests {
         ));
     }
 
+    /// Creating the default index twice keeps the first.
     #[test]
     fn ensure_default_index_idempotent() {
         let (_dir, store) = test_store();
@@ -399,6 +410,7 @@ mod tests {
         assert!(String::from_utf8(first).unwrap().contains("Demo"));
     }
 
+    /// A write over the size limit is rejected.
     #[test]
     fn write_rejects_too_large() {
         let dir = tempdir().unwrap();
@@ -409,6 +421,7 @@ mod tests {
         assert!(matches!(err, NomadError::TooLarge { .. }));
     }
 
+    /// Reading is allowed up to exactly the limit and rejected above it.
     #[test]
     fn read_exact_max_ok_over_max_rejects() {
         let dir = tempdir().unwrap();
@@ -422,6 +435,7 @@ mod tests {
         assert!(matches!(err, NomadError::TooLarge { .. }));
     }
 
+    /// A page over the limit is rejected without reading it all.
     #[test]
     fn read_page_rejects_oversize_without_full_alloc_contract() {
         let dir = tempdir().unwrap();
@@ -434,6 +448,7 @@ mod tests {
         assert!(matches!(err, NomadError::TooLarge { .. }));
     }
 
+    /// Listing skips dotfiles and `.allowed` files.
     #[test]
     fn list_skips_dotfiles_and_allowed_suffix() {
         let (dir, store) = test_store();
@@ -452,6 +467,7 @@ mod tests {
         assert!(store.read_file_rel(".cache").is_err());
     }
 
+    /// Listing skips symlinked directories and stops at the depth limit.
     #[test]
     #[cfg(unix)]
     fn list_skips_symlink_dirs_and_respects_depth() {
@@ -467,6 +483,7 @@ mod tests {
         assert!(!pages.iter().any(|p| p.path.starts_with("linkdir")));
     }
 
+    /// Creating the default index fails when `index.mu` is a dangling symlink.
     #[test]
     #[cfg(unix)]
     fn ensure_default_index_rejects_dangling_symlink() {
@@ -481,6 +498,7 @@ mod tests {
         assert!(!outside.exists());
     }
 
+    /// An empty name cannot be read or deleted.
     #[test]
     fn empty_string_read_and_delete_rejected() {
         let (_dir, store) = test_store();
@@ -490,6 +508,7 @@ mod tests {
         assert!(store.delete_file_rel("").is_err());
     }
 
+    /// Deleting a page that does not exist is not found.
     #[test]
     fn delete_missing_page_is_not_found() {
         let (_dir, store) = test_store();
@@ -499,6 +518,7 @@ mod tests {
         ));
     }
 
+    /// Writes to the same path at the same time leave one complete file.
     #[test]
     fn concurrent_atomic_writes_same_path() {
         let (dir, store) = test_store();

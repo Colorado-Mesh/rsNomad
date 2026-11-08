@@ -44,6 +44,7 @@ pub fn normalize_file_route(path: &str) -> Result<String, NomadError> {
     normalize_route(path, FILE_PREFIX, None, "file")
 }
 
+/// Turns a request path into a checked route under `prefix`, adding the default index for a bare directory.
 fn normalize_route(
     path: &str,
     prefix: &str,
@@ -86,6 +87,7 @@ pub fn strip_file_prefix(route: &str) -> Result<&str, NomadError> {
     strip_route_prefix(route, FILE_PREFIX, "file")
 }
 
+/// Removes a route prefix, or fails with an error naming the kind of route.
 fn strip_route_prefix<'a>(route: &'a str, prefix: &str, kind: &str) -> Result<&'a str, NomadError> {
     let route = route.trim();
     let rel = route
@@ -200,6 +202,7 @@ pub(crate) fn reject_if_symlink(path: &Path) -> Result<(), NomadError> {
     Ok(())
 }
 
+/// Rejects NUL, backslash and control characters.
 fn reject_invalid_chars(s: &str, ctx: &str) -> Result<(), NomadError> {
     if s.contains('\0') || s.contains('\\') {
         return Err(NomadError::InvalidPath(format!("invalid {ctx} characters")));
@@ -212,6 +215,7 @@ fn reject_invalid_chars(s: &str, ctx: &str) -> Result<(), NomadError> {
     Ok(())
 }
 
+/// Rejects a route with characters that must not appear in one.
 fn validate_route_chars(route: &str) -> Result<(), NomadError> {
     reject_invalid_chars(route, "route")
 }
@@ -221,6 +225,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Page routes are normalized.
     #[test]
     fn page_route_normalization() {
         assert_eq!(normalize_page_route("index.mu").unwrap(), "/page/index.mu");
@@ -231,6 +236,7 @@ mod tests {
         assert_eq!(normalize_page_route("/page").unwrap(), DEFAULT_INDEX_ROUTE);
     }
 
+    /// File routes are normalized.
     #[test]
     fn file_route_normalization() {
         assert_eq!(
@@ -244,6 +250,7 @@ mod tests {
         ));
     }
 
+    /// Paths that climb out of the root are rejected.
     #[test]
     fn rejects_traversal() {
         assert!(matches!(
@@ -253,6 +260,7 @@ mod tests {
         assert!(normalize_page_route("/page/../x.mu").is_err());
     }
 
+    /// NUL, backslash and `.` components are rejected.
     #[test]
     fn rejects_nul_backslash_and_curdir() {
         assert!(validate_content_relative_path("a\0b").is_err());
@@ -268,6 +276,7 @@ mod tests {
         ));
     }
 
+    /// A path that is too deep is rejected.
     #[test]
     fn rejects_path_too_deep() {
         let deep = (0..=MAX_PATH_COMPONENTS)
@@ -281,6 +290,7 @@ mod tests {
         ));
     }
 
+    /// The path hash is the first 16 bytes of the SHA-256 of the route.
     #[test]
     fn path_hash_is_truncated_sha256() {
         let h = path_hash("/page/index.mu");
@@ -288,6 +298,7 @@ mod tests {
         assert_eq!(path_hash(MEDIA_ROUTE), truncated_hash(b"/media"));
     }
 
+    /// A path that escapes the root is rejected.
     #[test]
     fn resolve_under_root_rejects_escape() {
         let dir = tempdir().unwrap();
@@ -301,6 +312,7 @@ mod tests {
         assert!(ok.ends_with("index.mu"));
     }
 
+    /// Control characters and symlinked components are rejected.
     #[test]
     fn rejects_control_characters_and_symlink_components() {
         assert!(validate_content_relative_path("evil\nname.mu").is_err());
@@ -340,6 +352,7 @@ mod tests {
         }
     }
 
+    /// Dotfiles and `.allowed` files are rejected.
     #[test]
     fn rejects_dotfiles_and_allowed_suffix() {
         assert!(is_hidden_or_allowlist_name(".secret"));
@@ -352,6 +365,7 @@ mod tests {
         assert!(normalize_file_route("/file/notes.allowed").is_err());
     }
 
+    /// Stripping a prefix reports the right errors.
     #[test]
     fn strip_prefix_error_paths() {
         assert!(matches!(
@@ -368,6 +382,7 @@ mod tests {
         ));
     }
 
+    /// A relative path or component that is too long is rejected.
     #[test]
     fn rejects_oversized_relative_path_and_component() {
         let long_path = "a".repeat(MAX_REL_PATH_BYTES + 1);
@@ -382,6 +397,7 @@ mod tests {
         ));
     }
 
+    /// A root that does not exist yet keeps the logical path.
     #[test]
     fn resolve_under_missing_root_keeps_logical_path() {
         let dir = tempdir().unwrap();

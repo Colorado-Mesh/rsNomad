@@ -107,6 +107,7 @@ pub async fn send_nomad_announce(
 mod tests {
     use super::*;
 
+    /// The destination hash differs from the identity hash.
     #[test]
     fn destination_hash_differs_from_identity_hash() {
         let identity = Identity::new();
@@ -114,6 +115,7 @@ mod tests {
         assert_ne!(dest, identity.hash);
     }
 
+    /// An announce packet is built and is not empty.
     #[test]
     fn announce_packet_nonempty() {
         let identity = Identity::new();
@@ -121,6 +123,7 @@ mod tests {
         assert!(raw.len() > 64);
     }
 
+    /// The announced display name is capped in length.
     #[test]
     fn announce_name_is_length_capped() {
         let identity = Identity::new();
@@ -132,6 +135,7 @@ mod tests {
         assert_eq!(raw.len(), short.len());
     }
 
+    /// No packet is built for a missing or empty name.
     #[test]
     fn announce_packet_none_and_empty_name() {
         let identity = Identity::new();
@@ -141,6 +145,7 @@ mod tests {
         assert!(!none.is_empty());
     }
 
+    /// Clamping a name trims it, strips control characters and cuts on a character boundary.
     #[test]
     fn clamp_trims_strips_controls_and_truncates_utf8() {
         assert_eq!(clamp_node_name("  hi\nthere  "), "hithere");
@@ -151,6 +156,7 @@ mod tests {
         assert!(clamped.starts_with('a'));
     }
 
+    /// Sending an announce on a closed channel reports that the transport is closed.
     #[tokio::test]
     async fn send_nomad_announce_closed_channel() {
         let identity = Identity::new();

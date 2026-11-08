@@ -31,6 +31,7 @@ pub struct MediaCacheConfig {
 }
 
 impl Default for MediaCacheConfig {
+    /// The default cache is in memory only.
     fn default() -> Self {
         Self {
             disk_root: None,
@@ -160,6 +161,7 @@ impl MediaCache {
         self.total_bytes
     }
 
+    /// Stores bytes in memory as the newest entry, then evicts the oldest until the cache is within its limits.
     fn insert_memory(&mut self, key: String, bytes: Vec<u8>) {
         if let Some(old) = self.memory.remove(&key) {
             self.total_bytes = self.total_bytes.saturating_sub(old.len() as u64);
@@ -180,6 +182,7 @@ impl MediaCache {
         }
     }
 
+    /// Marks an in-memory entry as the most recently used.
     fn touch(&mut self, key: &str) {
         if self.memory.contains_key(key) {
             self.order.retain(|k| k != key);
@@ -187,11 +190,13 @@ impl MediaCache {
         }
     }
 
+    /// Sets a disk file's modified time to now, so the disk prune sees it as recently used.
     fn touch_mtime(&self, path: &Path) {
         let now = SystemTime::now();
         let _ = filetime_set(path, now);
     }
 
+    /// Deletes the oldest files on disk until the cache is within its disk limits.
     fn prune(&mut self) -> Result<(), NomadError> {
         // Memory already pruned in insert_memory.
         let Some(root) = &self.config.disk_root else {
@@ -236,6 +241,7 @@ impl MediaCache {
     }
 }
 
+/// Reads a cache file into memory.
 fn read_file(path: &Path) -> Result<Vec<u8>, NomadError> {
     let mut f = File::open(path)?;
     let mut buf = Vec::new();
@@ -243,6 +249,7 @@ fn read_file(path: &Path) -> Result<Vec<u8>, NomadError> {
     Ok(buf)
 }
 
+/// Writes a cache file through a temporary file, so a reader never sees half of it.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), NomadError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -257,6 +264,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), NomadError> {
     Ok(())
 }
 
+/// Sets a file's modified time; callers ignore a failure.
 fn filetime_set(path: &Path, at: SystemTime) -> std::io::Result<()> {
     // Best-effort LRU hint for disk prune; failures are ignored by callers.
     #[cfg(unix)]
@@ -301,6 +309,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// The memory cache drops its oldest entry first.
     #[test]
     fn memory_lru_evicts_oldest() {
         let mut cache = MediaCache::new(MediaCacheConfig {
@@ -324,6 +333,7 @@ mod tests {
         );
     }
 
+    /// Clearing the cache removes both memory and disk entries.
     #[test]
     fn clear_wipes_memory_and_disk() {
         let dir = TempDir::new().unwrap();
@@ -337,6 +347,7 @@ mod tests {
         assert!(!dir.path().join("x.q85.d1200.webp").exists());
     }
 
+    /// Clearing one key leaves the others.
     #[test]
     fn clear_key_removes_one() {
         let mut cache = MediaCache::new(MediaCacheConfig::memory_only()).unwrap();
@@ -347,6 +358,7 @@ mod tests {
         assert_eq!(cache.get("b").unwrap().as_deref(), Some(b"2".as_slice()));
     }
 
+    /// A disk hit is copied back into memory.
     #[test]
     fn disk_get_promotes_to_memory() {
         let dir = TempDir::new().unwrap();
