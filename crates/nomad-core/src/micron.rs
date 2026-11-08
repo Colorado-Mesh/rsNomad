@@ -48,6 +48,18 @@ pub fn not_found_page(route: &str) -> String {
     )
 }
 
+/// Micron body for an executable page that failed (timed out, too much
+/// output, or could not run), so the visitor isn't left waiting.
+pub fn script_failed_page(route: &str) -> String {
+    let route = sanitize_micron_text(route);
+    format!(
+        "#!c=0\n\
+         > Page failed\n\
+         \n\
+         The page `{route}` could not be generated on this node.\n"
+    )
+}
+
 /// Micron body matching Python NomadNet `DEFAULT_NOTALLOWED` (ACL deny).
 pub fn not_allowed_page() -> &'static str {
     ">Request Not Allowed\n\
@@ -59,6 +71,7 @@ pub fn not_allowed_page() -> &'static str {
 mod tests {
     use super::*;
 
+    /// The default index page shows the node name.
     #[test]
     fn default_index_includes_name() {
         let page = default_index_page("Test Node");
@@ -66,24 +79,28 @@ mod tests {
         assert!(page.starts_with("#!c="));
     }
 
+    /// The not-found page names the route.
     #[test]
     fn not_found_includes_route() {
         let page = not_found_page("/page/missing.mu");
         assert!(page.contains("/page/missing.mu"));
     }
 
+    /// Sanitizing strips backticks and control characters.
     #[test]
     fn sanitize_strips_backticks_and_controls() {
         assert_eq!(sanitize_micron_text("a`b\nc"), "a'bc");
         assert!(sanitize_micron_text(&"x".repeat(200)).len() == MAX_MICRON_TEXT_CHARS);
     }
 
+    /// The default index page falls back to a name when the node's is empty.
     #[test]
     fn default_index_empty_name_falls_back() {
         let page = default_index_page("   ");
         assert!(page.contains("Nomad node"));
     }
 
+    /// Sanitizing cuts a multibyte name on a character boundary.
     #[test]
     fn sanitize_truncates_multibyte_at_char_limit() {
         let input = "😀".repeat(MAX_MICRON_TEXT_CHARS + 10);
@@ -92,6 +109,7 @@ mod tests {
         assert!(out.is_char_boundary(out.len()));
     }
 
+    /// The not-allowed page matches the reference implementation's default.
     #[test]
     fn not_allowed_matches_python_default() {
         let page = not_allowed_page();
