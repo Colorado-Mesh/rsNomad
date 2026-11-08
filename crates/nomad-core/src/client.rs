@@ -53,6 +53,7 @@ impl NomadEgress {
     }
 }
 
+/// Limits a hop count to 1 to 32 so timeouts stay bounded.
 fn bounded_hops(hops: u8) -> u64 {
     u64::from(hops.clamp(1, 32))
 }
@@ -169,12 +170,14 @@ mod tests {
     use super::*;
     use crate::request::decode_media_request;
 
+    /// A TCP link gets a 45 second timeout.
     #[test]
     fn tcp_timeout_is_45s() {
         assert_eq!(overall_timeout_secs(NomadEgress::Tcp, 8), 45);
         assert_eq!(overall_timeout_secs(NomadEgress::Network, 1), 45);
     }
 
+    /// The timeout grows with the hop count on radio links.
     #[test]
     fn rf_timeout_scales() {
         assert_eq!(overall_timeout_secs(NomadEgress::Rf, 1), 57);
@@ -182,6 +185,7 @@ mod tests {
         assert_eq!(overall_timeout_secs(NomadEgress::Ble, 6), 87);
     }
 
+    /// A TCP link is treated as at least one hop.
     #[test]
     fn initiator_hops_floored_for_tcp() {
         assert_eq!(link_initiator_hops(NomadEgress::Tcp, 1), 3);
@@ -189,6 +193,7 @@ mod tests {
         assert_eq!(link_initiator_hops(NomadEgress::Rf, 8), 8);
     }
 
+    /// A page request hashes the normalized route.
     #[test]
     fn page_request_hashes_normalized_route() {
         let req = build_page_request("index.mu", None).unwrap();
@@ -197,6 +202,7 @@ mod tests {
         assert!(req.body.is_empty());
     }
 
+    /// A page request carries its form fields.
     #[test]
     fn page_request_with_fields() {
         let mut fields = BTreeMap::new();
@@ -205,6 +211,7 @@ mod tests {
         assert!(!req.body.is_empty());
     }
 
+    /// A media request survives encoding and decoding.
     #[test]
     fn media_request_round_trip() {
         let req = build_media_request("header.webp");
@@ -214,6 +221,7 @@ mod tests {
         assert_eq!(parsed.path, "header.webp");
     }
 
+    /// The file name is read from binary reply metadata.
     #[test]
     fn reply_file_name_from_binary_metadata() {
         let meta = rns_runtime::link_manager::pack_file_name_metadata("Hero.webp");

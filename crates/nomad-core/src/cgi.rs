@@ -30,6 +30,7 @@ pub struct CgiOptions {
 }
 
 impl Default for CgiOptions {
+    /// The default options: the sanitized `PATH` and the standard timeout.
     fn default() -> Self {
         Self {
             path: SANITIZED_PATH.into(),
@@ -48,6 +49,7 @@ pub fn is_unix_executable(path: &Path) -> bool {
     }
 }
 
+/// On this platform no file counts as an executable page.
 #[cfg(not(unix))]
 pub fn is_unix_executable(_path: &Path) -> bool {
     false
@@ -80,6 +82,7 @@ pub fn run_cgi(
     )
 }
 
+/// Scripts are not supported on this platform, so this always fails.
 #[cfg(not(unix))]
 pub fn run_cgi(
     _script: &Path,
@@ -106,6 +109,7 @@ pub fn run_allowlist_script(script: &Path) -> Result<Vec<u8>, NomadError> {
     )
 }
 
+/// Executable `.allowed` files are not supported on this platform, so this always fails.
 #[cfg(not(unix))]
 pub fn run_allowlist_script(_script: &Path) -> Result<Vec<u8>, NomadError> {
     Err(NomadError::message(
@@ -113,6 +117,7 @@ pub fn run_allowlist_script(_script: &Path) -> Result<Vec<u8>, NomadError> {
     ))
 }
 
+/// Starts the script in its own process group with a clean environment, waits for it up to the timeout, and returns its stdout if it is within `max_stdout`.
 #[cfg(unix)]
 fn run_sandboxed(
     script: &Path,
@@ -212,6 +217,7 @@ fn terminate_process_group(child_pid: u32) {
     }
 }
 
+/// Waits for the child to exit, and fails once `timeout` has passed.
 #[cfg(unix)]
 fn wait_with_timeout(
     child: &mut std::process::Child,
@@ -234,6 +240,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// A script gets the request environment, and its stdout is returned.
     #[test]
     #[cfg(unix)]
     fn cgi_runs_script_with_env_and_caps_stdout() {
@@ -270,6 +277,7 @@ mod tests {
         assert!(!text.contains("nope"));
     }
 
+    /// Output over the size limit is an error.
     #[test]
     #[cfg(unix)]
     fn cgi_rejects_oversized_stdout() {
@@ -296,6 +304,7 @@ mod tests {
         assert!(matches!(err, NomadError::TooLarge { .. }));
     }
 
+    /// A timeout kills the script's whole process group.
     #[test]
     #[cfg(unix)]
     fn cgi_kills_process_group_on_timeout() {
@@ -318,6 +327,7 @@ mod tests {
         );
     }
 
+    /// The configured `PATH` and timeout are the ones the script gets.
     #[test]
     #[cfg(unix)]
     fn cgi_uses_the_configured_path_and_timeout() {
@@ -367,6 +377,7 @@ mod tests {
         );
     }
 
+    /// A path that does not exist is not executable.
     #[test]
     fn non_executable_is_false_for_missing() {
         assert!(!is_unix_executable(Path::new("/no/such/script")));

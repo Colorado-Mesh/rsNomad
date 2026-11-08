@@ -62,6 +62,7 @@ pub fn convert_bytes_to_webp(
     encode_webp(&img, quality)
 }
 
+/// Shrinks an image to fit `max_dimension` on its longest side; zero means no limit.
 fn maybe_downscale(img: DynamicImage, max_dimension: u32) -> DynamicImage {
     if max_dimension == 0 {
         return img;
@@ -77,6 +78,7 @@ fn maybe_downscale(img: DynamicImage, max_dimension: u32) -> DynamicImage {
     img.resize(nw, nh, FilterType::Triangle)
 }
 
+/// Encodes an image as WebP at the given quality.
 fn encode_webp(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, NomadError> {
     // Prefer lossy encoder when available (image-webp).
     #[allow(unused_variables)]
@@ -124,6 +126,7 @@ pub fn converted_basename(original_basename: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Test helper: a tiny valid PNG.
     fn tiny_png() -> Vec<u8> {
         // 1x1 red PNG
         let img = image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0]));
@@ -134,6 +137,7 @@ mod tests {
         buf
     }
 
+    /// A PNG converts to WebP.
     #[test]
     fn converts_png_to_webp() {
         let webp = convert_bytes_to_webp(&tiny_png(), 85, 1200).unwrap();
@@ -143,6 +147,7 @@ mod tests {
         assert!(webp.windows(4).any(|w| w == b"WEBP"));
     }
 
+    /// The file extension helpers recognise the supported types.
     #[test]
     fn extension_helpers() {
         assert!(is_media_ext("PNG"));
@@ -152,6 +157,7 @@ mod tests {
         assert_eq!(converted_basename("Hero.PNG"), "Hero.webp");
     }
 
+    /// The cache key is the same for the same input.
     #[test]
     fn cache_key_stable() {
         let src = tiny_png();

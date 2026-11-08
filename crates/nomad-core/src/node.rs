@@ -83,6 +83,7 @@ pub struct NomadNodeConfig {
 }
 
 impl Default for NomadNodeConfig {
+    /// The defaults: a one hour announce, the standard script timeout and no scripts.
     fn default() -> Self {
         Self {
             display_name: "Nomad node".into(),
@@ -130,12 +131,14 @@ struct RouteTable {
 }
 
 impl RouteTable {
+    /// Creates an empty route table.
     fn new() -> Self {
         Self {
             by_hash: HashMap::new(),
         }
     }
 
+    /// Adds a route by its path hash, and fails if a different route has the same hash.
     fn register(&mut self, route: String) -> Result<(), NomadError> {
         let hash = path_hash(&route);
         if let Some(existing) = self.by_hash.get(&hash) {
@@ -149,11 +152,13 @@ impl RouteTable {
         Ok(())
     }
 
+    /// Removes every route.
     fn clear(&mut self) {
         self.by_hash.clear();
     }
 }
 
+/// Clears the route table and registers every page and file in the store, plus the media route.
 fn rebuild_routes(routes: &mut RouteTable, store: &NomadContentStore) -> Result<(), NomadError> {
     routes.clear();
     for page in store.list_pages()? {
@@ -195,6 +200,7 @@ struct RequestBudget {
 }
 
 impl RequestBudget {
+    /// Creates a budget with no requests in flight.
     fn new() -> Self {
         Self {
             state: Mutex::new(RequestBudgetState {
@@ -233,6 +239,7 @@ struct RequestBudgetGuard<'a> {
 }
 
 impl Drop for RequestBudgetGuard<'_> {
+    /// Releases the in-flight slot when a request finishes.
     fn drop(&mut self) {
         let mut state = self.budget.state.lock().unwrap_or_else(|e| {
             tracing::warn!("request budget lock poisoned on drop; recovering");
@@ -253,6 +260,7 @@ struct NomadServeStatsInner {
 }
 
 impl NomadServeStatsInner {
+    /// Creates counters that all start at zero.
     fn new() -> Self {
         Self {
             request_count: AtomicU64::new(0),
@@ -265,6 +273,7 @@ impl NomadServeStatsInner {
         }
     }
 
+    /// Copies the counters into a plain snapshot.
     fn snapshot(&self) -> NomadServeStats {
         let last = self.last_request_ms.load(Ordering::Relaxed);
         NomadServeStats {
@@ -289,6 +298,7 @@ impl NomadServeStatsInner {
     }
 }
 
+/// Returns the node's current display name, even if its lock was poisoned.
 fn shared_display_name(shared: &SharedState) -> String {
     shared
         .display_name
@@ -531,6 +541,7 @@ impl NomadNode {
 }
 
 impl Drop for NomadNode {
+    /// Stops the background tasks when the node is dropped.
     fn drop(&mut self) {
         self._link_task.abort();
         if let Some(task) = self._announce_task.take() {
@@ -548,6 +559,7 @@ fn should_stop_announce_loop(err: &NomadError) -> bool {
     matches!(err, NomadError::TransportClosed)
 }
 
+/// Finds the route registered for a path hash, even if the lock was poisoned.
 fn lookup_route(shared: &SharedState, path_hash_bytes: [u8; 16]) -> Option<String> {
     let routes = shared.routes.read().unwrap_or_else(|e| {
         tracing::warn!("routes lock poisoned; recovering");
@@ -556,6 +568,7 @@ fn lookup_route(shared: &SharedState, path_hash_bytes: [u8; 16]) -> Option<Strin
     routes.by_hash.get(&path_hash_bytes).cloned()
 }
 
+/// Answers one link request: checks the request budget, finds the route, and serves a page, a file or media.
 fn handle_request(
     shared: &SharedState,
     link_id: [u8; 16],
@@ -605,10 +618,12 @@ fn handle_request(
     }
 }
 
+/// The reply for a visitor who is not on the allow list.
 fn deny_pages_or_files() -> RequestOutcome {
     RequestOutcome::Reply(not_allowed_page().as_bytes().to_vec())
 }
 
+/// Serves a page. An executable page runs as a script when scripts are on, and a script that fails gets an error page.
 fn serve_page(
     shared: &SharedState,
     route: &str,
@@ -688,6 +703,7 @@ fn serve_page(
     }
 }
 
+/// Serves a file from the files directory, after the allow list check.
 fn serve_file(
     shared: &SharedState,
     route: &str,
@@ -739,6 +755,7 @@ fn serve_file(
     }
 }
 
+/// Serves an image from the media route, converting and caching it as needed.
 fn serve_media(
     shared: &SharedState,
     data: &[u8],
@@ -855,6 +872,7 @@ mod tests {
     use rns_runtime::link_manager::RequestOutcome;
     use tempfile::TempDir;
 
+    /// Test helper: shared state with the given pages and files and scripts off.
     fn shared_with_content(
         dir: &TempDir,
         pages: &[(&str, &[u8])],
@@ -863,11 +881,29 @@ mod tests {
         shared_with_content_opts(dir, pages, files, false)
     }
 
+    /// Test helper: like `shared_with_content`, with scripts on or off.
     fn shared_with_content_opts(
         dir: &TempDir,
         pages: &[(&str, &[u8])],
         files: &[(&str, &[u8])],
         allow_executable_pages: bool,
+    ) -> Arc<SharedState> {
+        shared_with_cgi(
+            dir,
+            pages,
+            files,
+            allow_executable_pages,
+            CgiOptions::default(),
+        )
+    }
+
+    /// Test helper: like `shared_with_content_opts`, with chosen script options.
+    fn shared_with_cgi(
+        dir: &TempDir,
+        pages: &[(&str, &[u8])],
+        files: &[(&str, &[u8])],
+        allow_executable_pages: bool,
+        cgi: CgiOptions,
     ) -> Arc<SharedState> {
         let store = NomadContentStore::new(NomadContentRoots::under(dir.path())).unwrap();
         for (path, body) in pages {
@@ -883,7 +919,7 @@ mod tests {
             stats: NomadServeStatsInner::new(),
             budget: RequestBudget::new(),
             allow_executable_pages,
-            cgi: CgiOptions::default(),
+            cgi,
             media_cache: Mutex::new(MediaCache::new(MediaCacheConfig::memory_only()).unwrap()),
             media_conversion_quality: DEFAULT_CONVERSION_QUALITY,
             media_conversion_max_dimension: DEFAULT_CONVERSION_MAX_DIMENSION,
@@ -895,6 +931,7 @@ mod tests {
         shared
     }
 
+    /// Test helper: sends a request for a route hash straight to the request handler.
     fn call(
         shared: &SharedState,
         route_hash: [u8; 16],
@@ -904,12 +941,14 @@ mod tests {
         handle_request(shared, [0u8; 16], route_hash, data, remote)
     }
 
+    /// Test helper: an identity with a chosen hash.
     fn identity_with_hash(hash: [u8; 16]) -> Identity {
         let mut id = Identity::new();
         id.hash = hash;
         id
     }
 
+    /// The request handler serves both a page and a file.
     #[test]
     fn link_request_handler_serves_page_and_file() {
         let dir = TempDir::new().unwrap();
@@ -960,6 +999,7 @@ mod tests {
         assert_eq!(shared.stats.snapshot().visitors, 2);
     }
 
+    /// A file reply keeps the nested relative name.
     #[test]
     fn file_reply_preserves_nested_relative_name() {
         let dir = TempDir::new().unwrap();
@@ -980,6 +1020,7 @@ mod tests {
         }
     }
 
+    /// An unknown path hash neither clears nor rescans the routes.
     #[test]
     fn unknown_path_hash_does_not_clear_or_rescan_routes() {
         let dir = TempDir::new().unwrap();
@@ -1004,6 +1045,7 @@ mod tests {
         }
     }
 
+    /// A missing file gets no reply.
     #[test]
     fn missing_file_drops_without_reply() {
         let dir = TempDir::new().unwrap();
@@ -1019,6 +1061,7 @@ mod tests {
         assert_eq!(shared.stats.not_found_count.load(Ordering::Relaxed), 1);
     }
 
+    /// The request budget limits how many requests run at once.
     #[test]
     fn request_budget_bounds_in_flight_concurrency() {
         let budget = RequestBudget::new();
@@ -1037,6 +1080,7 @@ mod tests {
         );
     }
 
+    /// The request budget limits how many requests arrive in a time window.
     #[test]
     fn request_budget_bounds_window_count() {
         let budget = RequestBudget::new();
@@ -1046,6 +1090,7 @@ mod tests {
         assert!(budget.try_acquire().is_none(), "must reject over window");
     }
 
+    /// Dotfile routes that were never registered are not served.
     #[test]
     fn link_request_handler_skips_unregistered_dotfile_routes() {
         let dir = TempDir::new().unwrap();
@@ -1062,6 +1107,7 @@ mod tests {
         assert_eq!(shared.stats.page_hits.load(Ordering::Relaxed), 0);
     }
 
+    /// Reloading the routes picks up a new page.
     #[test]
     fn reload_routes_picks_up_new_page() {
         let dir = TempDir::new().unwrap();
@@ -1086,6 +1132,7 @@ mod tests {
         }
     }
 
+    /// The request budget keeps working after its lock was poisoned.
     #[test]
     fn request_budget_recovers_from_poison() {
         let budget = RequestBudget::new();
@@ -1103,6 +1150,7 @@ mod tests {
         );
     }
 
+    /// Route lookup keeps working after its lock was poisoned.
     #[test]
     fn lookup_route_recovers_from_poison() {
         let dir = TempDir::new().unwrap();
@@ -1118,6 +1166,7 @@ mod tests {
         );
     }
 
+    /// The announce loop stops only when the transport is closed.
     #[test]
     fn announce_loop_stops_only_on_transport_closed() {
         assert!(should_stop_announce_loop(&NomadError::TransportClosed));
@@ -1127,6 +1176,7 @@ mod tests {
         )));
     }
 
+    /// Two routes with the same hash are reported as a collision.
     #[test]
     fn route_register_detects_hash_collision() {
         let mut table = RouteTable::new();
@@ -1139,6 +1189,7 @@ mod tests {
         assert!(err.to_string().contains("collision"));
     }
 
+    /// The display name is clamped when it is set through the shared lock.
     #[test]
     fn display_name_clamp_via_shared_mutex() {
         let dir = TempDir::new().unwrap();
@@ -1162,6 +1213,7 @@ mod tests {
         assert_eq!(shared_display_name(&shared), "recovered");
     }
 
+    /// The media route is registered.
     #[test]
     fn media_route_is_registered() {
         let dir = TempDir::new().unwrap();
@@ -1172,6 +1224,7 @@ mod tests {
         );
     }
 
+    /// Media is served as WebP with the base name in the metadata.
     #[test]
     fn media_serves_webp_with_basename_metadata() {
         let dir = TempDir::new().unwrap();
@@ -1199,6 +1252,7 @@ mod tests {
         assert_eq!(shared.stats.media_hits.load(Ordering::Relaxed), 1);
     }
 
+    /// A media request for a missing key gets no reply.
     #[test]
     fn media_missing_key_drops() {
         let dir = TempDir::new().unwrap();
@@ -1215,6 +1269,7 @@ mod tests {
         }
     }
 
+    /// A PNG is converted to WebP and cached.
     #[test]
     fn media_converts_png_and_caches() {
         let dir = TempDir::new().unwrap();
@@ -1255,6 +1310,7 @@ mod tests {
         assert_eq!(shared.media_cache.lock().unwrap().memory_len(), 0);
     }
 
+    /// An unsupported media extension is rejected.
     #[test]
     fn media_rejects_unsupported_ext() {
         let dir = TempDir::new().unwrap();
@@ -1266,6 +1322,7 @@ mod tests {
         }
     }
 
+    /// An anonymous visitor to a protected page gets the not-allowed page.
     #[test]
     fn allowed_denies_anonymous_page_with_not_allowed_body() {
         let dir = TempDir::new().unwrap();
@@ -1298,6 +1355,7 @@ mod tests {
         }
     }
 
+    /// An anonymous visitor to a protected file gets the not-allowed page.
     #[test]
     fn allowed_denies_file_with_not_allowed_body() {
         let dir = TempDir::new().unwrap();
@@ -1317,6 +1375,7 @@ mod tests {
         }
     }
 
+    /// A denied media request gets no reply.
     #[test]
     fn media_acl_deny_drops() {
         let dir = TempDir::new().unwrap();
@@ -1345,6 +1404,7 @@ mod tests {
         }
     }
 
+    /// With scripts off, an executable page's text is not sent.
     #[test]
     #[cfg(unix)]
     fn cgi_off_does_not_send_an_executable_pages_text() {
@@ -1370,6 +1430,7 @@ mod tests {
         }
     }
 
+    /// With scripts on, an executable page runs with the request's form fields.
     #[test]
     #[cfg(unix)]
     fn cgi_on_runs_executable_page_with_fields() {
@@ -1396,38 +1457,65 @@ mod tests {
         }
     }
 
-    #[test]
+    /// Writes an executable script into the pages directory and refreshes the routes.
     #[cfg(unix)]
-    fn cgi_failure_replies_with_an_error_page() {
+    fn write_script(shared: &SharedState, dir: &TempDir, name: &str, body: &str) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = TempDir::new().unwrap();
-        let shared = shared_with_content_opts(&dir, &[("index.mu", b"> ok\n")], &[], true);
-        let script = dir.path().join("pages/huge.mu");
-        let max = shared.store.roots().max_page_bytes;
-        std::fs::write(
-            &script,
-            format!("#!/bin/sh\nhead -c {} /dev/zero\n", max + 1),
-        )
-        .unwrap();
+        let script = dir.path().join("pages").join(name);
+        std::fs::write(&script, body).unwrap();
         let mut perms = std::fs::metadata(&script).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
-        {
-            let mut routes = shared.routes.write().unwrap();
-            rebuild_routes(&mut routes, &shared.store).unwrap();
-        }
-        match call(&shared, path_hash("/page/huge.mu"), Vec::new(), None) {
+        let mut routes = shared.routes.write().unwrap();
+        rebuild_routes(&mut routes, &shared.store).unwrap();
+    }
+
+    /// Asserts that `route` answers with the failure page naming that route.
+    #[cfg(unix)]
+    fn assert_failure_page(shared: &SharedState, route: &str) {
+        match call(shared, path_hash(route), Vec::new(), None) {
             RequestOutcome::Reply(bytes) => {
                 let body = String::from_utf8_lossy(&bytes);
                 assert!(
-                    body.contains("Page failed") && body.contains("/page/huge.mu"),
+                    body.contains("Page failed") && body.contains(route),
                     "{body}"
                 );
             }
-            other => panic!("expected an error page, got {other:?}"),
+            other => panic!("expected an error page for {route}, got {other:?}"),
         }
     }
 
+    /// A script that is too big, too slow or cannot start gets an error page naming its route.
+    #[test]
+    #[cfg(unix)]
+    fn cgi_failure_replies_with_an_error_page() {
+        let dir = TempDir::new().unwrap();
+        let cgi = CgiOptions {
+            timeout: std::time::Duration::from_millis(300),
+            ..CgiOptions::default()
+        };
+        let shared = shared_with_cgi(&dir, &[("index.mu", b"> ok\n")], &[], true, cgi);
+        let max = shared.store.roots().max_page_bytes;
+
+        // Output over the page limit.
+        write_script(
+            &shared,
+            &dir,
+            "huge.mu",
+            &format!("#!/bin/sh\nhead -c {} /dev/zero\n", max + 1),
+        );
+        assert_failure_page(&shared, "/page/huge.mu");
+
+        // A script that outlives the timeout.
+        write_script(&shared, &dir, "slow.mu", "#!/bin/sh\nsleep 30\n");
+        assert_failure_page(&shared, "/page/slow.mu");
+
+        // An executable whose interpreter does not exist, so it cannot start.
+        write_script(&shared, &dir, "broken.mu", "#!/nonexistent/interpreter\n");
+        assert_failure_page(&shared, "/page/broken.mu");
+    }
+
+    /// The allow list is checked before a script runs.
     #[test]
     #[cfg(unix)]
     fn acl_runs_before_cgi() {
@@ -1457,6 +1545,7 @@ mod tests {
         }
     }
 
+    /// An executable `.allowed` file runs when scripts are on.
     #[test]
     #[cfg(unix)]
     fn executable_allowed_runs_when_cgi_enabled() {

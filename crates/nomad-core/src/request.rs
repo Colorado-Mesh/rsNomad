@@ -105,6 +105,7 @@ pub fn decode_request_fields(data: &[u8]) -> Result<NomadRequestFields, NomadErr
     Ok(out)
 }
 
+/// Reads a request value as text; binary, numbers and booleans are turned into text and other types are skipped.
 fn value_as_string(value: &rmpv::Value) -> Option<String> {
     match value {
         rmpv::Value::String(s) => s.as_str().map(str::to_owned),
@@ -197,11 +198,13 @@ pub fn decode_media_request(data: &[u8]) -> Result<MediaRequest, NomadError> {
 mod tests {
     use super::*;
 
+    /// Encoding no fields gives no bytes.
     #[test]
     fn encode_empty_map_yields_empty_bytes() {
         assert!(encode_request_fields(&BTreeMap::new()).is_empty());
     }
 
+    /// Encoded fields decode back to the same fields.
     #[test]
     fn encode_round_trips_through_decode() {
         let mut fields = BTreeMap::new();
@@ -213,6 +216,7 @@ mod tests {
         assert_eq!(parsed.fields, fields);
     }
 
+    /// Encoding skips a key or value that is too long.
     #[test]
     fn encode_skips_oversized_key_and_value() {
         let mut fields = BTreeMap::new();
@@ -228,6 +232,7 @@ mod tests {
         assert_eq!(parsed.fields.get("ok").map(String::as_str), Some("v"));
     }
 
+    /// Encoding keeps only up to the field limit.
     #[test]
     fn encode_caps_field_count() {
         let mut fields = BTreeMap::new();
@@ -239,6 +244,7 @@ mod tests {
         assert_eq!(parsed.fields.len(), MAX_REQUEST_FIELDS);
     }
 
+    /// A msgpack map of strings decodes to fields.
     #[test]
     fn decodes_msgpack_string_map() {
         let map = vec![
@@ -264,6 +270,7 @@ mod tests {
         );
     }
 
+    /// Invalid input decodes to no fields.
     #[test]
     fn empty_on_invalid() {
         let parsed = decode_request_fields(b"not-msgpack").unwrap();
@@ -271,6 +278,7 @@ mod tests {
         assert_eq!(parsed.raw, b"not-msgpack");
     }
 
+    /// An empty body decodes to no fields.
     #[test]
     fn empty_body_yields_empty_fields() {
         let parsed = decode_request_fields(b"").unwrap();
@@ -278,6 +286,7 @@ mod tests {
         assert!(parsed.raw.is_empty());
     }
 
+    /// A body that is not a map decodes to no fields.
     #[test]
     fn non_map_yields_empty_fields() {
         let mut buf = Vec::new();
@@ -286,6 +295,7 @@ mod tests {
         assert!(parsed.fields.is_empty());
     }
 
+    /// Integers and booleans become text.
     #[test]
     fn coerces_integer_and_bool_values() {
         let map = vec![
@@ -308,6 +318,7 @@ mod tests {
         );
     }
 
+    /// A body over the size limit is rejected.
     #[test]
     fn rejects_oversized_body() {
         let big = vec![0u8; MAX_REQUEST_BODY_BYTES + 1];
@@ -315,6 +326,7 @@ mod tests {
         assert!(matches!(err, NomadError::TooLarge { .. }));
     }
 
+    /// Decoding keeps only up to the field limit.
     #[test]
     fn caps_field_count() {
         let map: Vec<_> = (0..MAX_REQUEST_FIELDS + 10)
@@ -331,6 +343,7 @@ mod tests {
         assert_eq!(parsed.fields.len(), MAX_REQUEST_FIELDS);
     }
 
+    /// Binary and float values become text.
     #[test]
     fn coerces_binary_and_f64_values() {
         let map = vec![
@@ -358,6 +371,7 @@ mod tests {
         assert!(!parsed.fields.contains_key("field_bad_bin"));
     }
 
+    /// Decoding skips a key or value that is too long.
     #[test]
     fn skips_oversized_key_and_value() {
         let map = vec![
@@ -381,6 +395,7 @@ mod tests {
         assert_eq!(parsed.fields.get("ok").map(String::as_str), Some("v"));
     }
 
+    /// Deeply nested input decodes to no fields instead of overflowing the stack.
     #[test]
     fn deeply_nested_msgpack_yields_empty_fields() {
         // Nest maps deeper than MAX_REQUEST_MSGPACK_DEPTH so decode fails soft.
@@ -395,6 +410,7 @@ mod tests {
         assert_eq!(parsed.raw, buf);
     }
 
+    /// A media request with a nil key round-trips.
     #[test]
     fn media_request_round_trips_with_nil_key() {
         let encoded = encode_media_request("header.webp");
@@ -402,6 +418,7 @@ mod tests {
         assert_eq!(parsed.path, "header.webp");
     }
 
+    /// A media request needs a key field.
     #[test]
     fn media_request_requires_key_field() {
         let map = vec![(
@@ -414,6 +431,7 @@ mod tests {
         assert!(matches!(err, NomadError::InvalidPath(_)));
     }
 
+    /// A media request needs a path field.
     #[test]
     fn media_request_requires_path_field() {
         let map = vec![(rmpv::Value::String("key".into()), rmpv::Value::Nil)];
@@ -422,6 +440,7 @@ mod tests {
         assert!(decode_media_request(&buf).is_err());
     }
 
+    /// A media request accepts a key that is not nil.
     #[test]
     fn media_request_accepts_non_nil_key() {
         let map = vec![
@@ -439,6 +458,7 @@ mod tests {
         assert_eq!(decode_media_request(&buf).unwrap().path, "a.webp");
     }
 
+    /// A media request with a path that is not text is rejected.
     #[test]
     fn media_request_rejects_non_string_path() {
         for path_val in [
